@@ -10,14 +10,55 @@
 #
 
 import os
-import numpy as np
-
 import subprocess
-cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
-result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
-os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
+import sys
 
-os.system('echo $CUDA_VISIBLE_DEVICES')
+
+def configure_cuda_device(argv):
+    """Select the requested GPU before importing or initializing PyTorch."""
+    requested_gpu = None
+    for index, argument in enumerate(argv):
+        if argument == "--gpu" and index + 1 < len(argv):
+            requested_gpu = argv[index + 1]
+        elif argument.startswith("--gpu="):
+            requested_gpu = argument.split("=", maxsplit=1)[1]
+
+    if requested_gpu and requested_gpu != "-1":
+        os.environ["CUDA_VISIBLE_DEVICES"] = requested_gpu
+        return
+
+    if os.environ.get("CUDA_VISIBLE_DEVICES"):
+        return
+
+    try:
+        query = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        memory_used = [
+            int(value.strip())
+            for value in query.stdout.splitlines()
+            if value.strip()
+        ]
+        if memory_used:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(
+                min(range(len(memory_used)), key=memory_used.__getitem__)
+            )
+    except (FileNotFoundError, subprocess.CalledProcessError, ValueError):
+        # Let PyTorch use its default device selection and report any CUDA
+        # problem normally when the training process starts.
+        pass
+
+
+configure_cuda_device(sys.argv[1:])
+
+import numpy as np
 
 
 import torch
@@ -35,7 +76,6 @@ import lpips
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import prefilter_voxel, render, network_gui
-import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 import uuid
@@ -472,6 +512,11 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--gpu", type=str, default = '-1')
+    parser.add_argument(
+        "--skip_postprocess",
+        action="store_true",
+        help="Skip the built-in held-out rendering and metrics pass after training.",
+    )
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
@@ -533,12 +578,13 @@ if __name__ == "__main__":
     # All done
     logger.info("\nTraining complete.")
 
-    # rendering
-    logger.info(f'\nStarting Rendering~')
-    visible_count = render_sets(lp.extract(args), -1, pp.extract(args), wandb=wandb, logger=logger)
-    logger.info("\nRendering complete.")
+    if not args.skip_postprocess:
+        # rendering
+        logger.info(f'\nStarting Rendering~')
+        visible_count = render_sets(lp.extract(args), -1, pp.extract(args), wandb=wandb, logger=logger)
+        logger.info("\nRendering complete.")
 
-    # calc metrics
-    logger.info("\n Starting evaluation...")
-    evaluate(args.model_path, visible_count=visible_count, wandb=wandb, logger=logger)
-    logger.info("\nEvaluating complete.")
+        # calc metrics
+        logger.info("\n Starting evaluation...")
+        evaluate(args.model_path, visible_count=visible_count, wandb=wandb, logger=logger)
+        logger.info("\nEvaluating complete.")

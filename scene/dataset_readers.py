@@ -159,7 +159,32 @@ def readColmapSceneInfo(path, images, eval, lod, llffhold=8):
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
     reading_dir = "images" if images == None else images
-    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
+    images_folder = os.path.join(path, reading_dir)
+
+    # Competition COLMAP models can contain registered cameras for withheld
+    # images. Keep only records with an image that is actually available for
+    # training; otherwise Image.open() below fails on the first withheld view.
+    available_extrinsics = {
+        key: extrinsic
+        for key, extrinsic in cam_extrinsics.items()
+        if os.path.isfile(os.path.join(images_folder, os.path.basename(extrinsic.name)))
+    }
+    skipped_count = len(cam_extrinsics) - len(available_extrinsics)
+    if skipped_count:
+        print(
+            f"Skipping {skipped_count} COLMAP camera record(s) without an "
+            f"image in {images_folder}"
+        )
+    if not available_extrinsics:
+        raise FileNotFoundError(
+            f"No COLMAP-registered images were found in {images_folder}"
+        )
+
+    cam_infos_unsorted = readColmapCameras(
+        cam_extrinsics=available_extrinsics,
+        cam_intrinsics=cam_intrinsics,
+        images_folder=images_folder,
+    )
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     if eval:

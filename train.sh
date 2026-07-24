@@ -28,8 +28,16 @@ done
 
 time=$(date "+%Y-%m-%d_%H:%M:%S")
 
+# Viettel AI Race scenes keep the competition's train/test split one level
+# below the scene directory. Resolve that layout without copying any data;
+# the fallback preserves the original repository behavior for public sets.
+source_path="data/${data}"
+if [ -d "${source_path}/train/images" ] && [ -d "${source_path}/train/sparse/0" ]; then
+    source_path="${source_path}/train"
+fi
+
 if [ "$warmup" = "True" ]; then
-    python train.py --eval -s data/${data} --lod ${lod} --gpu ${gpu} --voxel_size ${vsize} --update_init_factor ${update_init_factor} --appearance_dim ${appearance_dim} --ratio ${ratio} --warmup --iterations ${iterations} --port $port -m outputs/${data}/${logdir}/$time
+    python train.py --eval -s "${source_path}" --lod ${lod} --gpu ${gpu} --voxel_size ${vsize} --update_init_factor ${update_init_factor} --appearance_dim ${appearance_dim} --ratio ${ratio} --warmup --iterations ${iterations} --port $port -m outputs/${data}/${logdir}/$time
 else
-    python train.py --eval -s data/${data} --lod ${lod} --gpu ${gpu} --voxel_size ${vsize} --update_init_factor ${update_init_factor} --appearance_dim ${appearance_dim} --ratio ${ratio} --iterations ${iterations} --port $port -m outputs/${data}/${logdir}/$time
+    python train.py --eval -s "${source_path}" --lod ${lod} --gpu ${gpu} --voxel_size ${vsize} --update_init_factor ${update_init_factor} --appearance_dim ${appearance_dim} --ratio ${ratio} --iterations ${iterations} --port $port -m outputs/${data}/${logdir}/$time
 fi
