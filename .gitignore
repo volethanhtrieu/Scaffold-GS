@@ -15,3 +15,10 @@ diff_rasterization/dist
 tensorboard_3d
 screenshots
 *.so
+
+# Large local datasets and generated results
+/data/
+/output/
+
+# Documents that should remain local
+*.pdf
