@@ -53,5 +53,24 @@ CSV values in this public data use `.JPG`/`.jpg` source names; if the organizer
 explicitly requires the literal extension, use
 `--filename-mode image-name` instead.
 
+If the submission portal enforces a 350 MB archive limit, lossless PNG may be
+too large for all full-resolution views. The supplied CSV names use JPEG
+extensions, so a size-limited literal-name JPEG archive can be generated
+without resizing any prediction:
+
+```bash
+python generate_submission.py \
+  --filename-mode image-name \
+  --transcode-jpeg \
+  --jpeg-quality 92 \
+  --jpeg-subsampling 420 \
+  --max-size-mb 350
+```
+
+The output is replaced atomically only when every expected image is valid and
+the completed archive is within the configured limit. If quality 92 exceeds
+the limit, lower `--jpeg-quality` gradually; if it is comfortably below the
+limit, try a higher value to preserve more image quality.
+
 None of these scripts delete source data. `train_competition.py` refuses to
 reuse a non-empty output directory unless `--allow-existing-output` is passed.

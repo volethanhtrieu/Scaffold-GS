@@ -22,4 +22,5 @@ screenshots
 
 # Documents that should remain local
 *.pdf
+*.zip
 AGENTS.md

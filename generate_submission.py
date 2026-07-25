@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import os
 import struct
 import sys
@@ -267,12 +268,28 @@ def validate_predictions(
 
 
 def write_submission(
-    selected: Sequence[Tuple[Path, str, str]], output_path: Path
+    selected: Sequence[Tuple[Path, str, str]],
+    output_path: Path,
+    jpeg_quality: Optional[int] = None,
+    jpeg_subsampling: int = 2,
+    max_size_bytes: Optional[int] = None,
 ) -> None:
-    """Write the archive atomically and verify its entries."""
+    """Write the archive atomically, optionally transcoding images to JPEG."""
     output_path = output_path.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Optional[Path] = None
+    image_module = None
+    unidentified_image_error = OSError
+    if jpeg_quality is not None:
+        try:
+            from PIL import Image, UnidentifiedImageError
+        except ImportError as error:
+            raise SubmissionError(
+                "JPEG transcoding requires Pillow in the active environment"
+            ) from error
+        image_module = Image
+        unidentified_image_error = UnidentifiedImageError
+
     try:
         with tempfile.NamedTemporaryFile(
             mode="wb",
@@ -284,15 +301,47 @@ def write_submission(
             temporary_path = Path(temporary.name)
 
         archive_names: Set[str] = set()
-        with zipfile.ZipFile(
-            temporary_path, "w", compression=zipfile.ZIP_DEFLATED
-        ) as archive:
+        compression = (
+            zipfile.ZIP_STORED
+            if jpeg_quality is not None
+            else zipfile.ZIP_DEFLATED
+        )
+        with zipfile.ZipFile(temporary_path, "w", compression=compression) as archive:
             for source, scene_name, archive_name in selected:
                 member_name = f"{scene_name}/{archive_name}"
                 if member_name in archive_names:
                     raise SubmissionError(f"duplicate archive member: {member_name}")
                 archive_names.add(member_name)
-                archive.write(source, arcname=member_name)
+                if jpeg_quality is None:
+                    archive.write(source, arcname=member_name)
+                    continue
+
+                if Path(archive_name).suffix.casefold() not in (".jpg", ".jpeg"):
+                    raise SubmissionError(
+                        "JPEG transcoding requires every CSV image_name to end "
+                        f"in .jpg or .jpeg; got {archive_name}"
+                    )
+                try:
+                    assert image_module is not None
+                    with image_module.open(source) as image:
+                        rgb_image = image.convert("RGB")
+                        encoded = io.BytesIO()
+                        rgb_image.save(
+                            encoded,
+                            format="JPEG",
+                            quality=jpeg_quality,
+                            subsampling=jpeg_subsampling,
+                            optimize=True,
+                        )
+                except (OSError, unidentified_image_error) as error:
+                    raise SubmissionError(
+                        f"could not transcode {source} to JPEG: {error}"
+                    ) from error
+                archive.writestr(
+                    member_name,
+                    encoded.getvalue(),
+                    compress_type=zipfile.ZIP_STORED,
+                )
 
         with zipfile.ZipFile(temporary_path, "r") as archive:
             broken_member = archive.testzip()
@@ -300,6 +349,13 @@ def write_submission(
                 raise SubmissionError(
                     f"archive integrity check failed at {broken_member}"
                 )
+        archive_size = temporary_path.stat().st_size
+        if max_size_bytes is not None and archive_size > max_size_bytes:
+            raise SubmissionError(
+                f"archive is {archive_size / 1_000_000:.2f} MB, exceeding "
+                f"the configured {max_size_bytes / 1_000_000:.2f} MB limit; "
+                "lower --jpeg-quality and try again"
+            )
         os.replace(temporary_path, output_path)
         temporary_path = None
     finally:
@@ -339,12 +395,60 @@ def build_parser() -> argparse.ArgumentParser:
             "the CSV stem; image-name preserves the CSV extension literally."
         ),
     )
+    parser.add_argument(
+        "--transcode-jpeg",
+        action="store_true",
+        help=(
+            "Transcode predictions to RGB JPEG while preserving literal CSV "
+            "image_name values. Requires --filename-mode image-name."
+        ),
+    )
+    parser.add_argument(
+        "--jpeg-quality",
+        type=int,
+        default=92,
+        help="JPEG quality from 1 to 100 (default: 92).",
+    )
+    parser.add_argument(
+        "--jpeg-subsampling",
+        choices=("444", "422", "420"),
+        default="420",
+        help="JPEG chroma subsampling (default: 420 for smaller files).",
+    )
+    parser.add_argument(
+        "--max-size-mb",
+        type=float,
+        default=None,
+        help=(
+            "Reject the archive instead of replacing the output when it "
+            "exceeds this decimal-megabyte limit."
+        ),
+    )
     return parser
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
     """Build the requested submission archive."""
     args = build_parser().parse_args(argv)
+    if args.transcode_jpeg and args.filename_mode != "image-name":
+        print(
+            "ERROR: --transcode-jpeg requires --filename-mode image-name",
+            file=sys.stderr,
+        )
+        return 2
+    if not 1 <= args.jpeg_quality <= 100:
+        print("ERROR: --jpeg-quality must be between 1 and 100", file=sys.stderr)
+        return 2
+    if args.max_size_mb is not None and args.max_size_mb <= 0:
+        print("ERROR: --max-size-mb must be positive", file=sys.stderr)
+        return 2
+
+    subsampling_values = {"444": 0, "422": 1, "420": 2}
+    max_size_bytes = (
+        int(args.max_size_mb * 1_000_000)
+        if args.max_size_mb is not None
+        else None
+    )
     try:
         scene_dirs = discover_scenes(args.data_root.resolve(), args.scenes)
         selected = validate_predictions(
@@ -352,19 +456,31 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             args.predictions_root.resolve(),
             args.filename_mode,
         )
-        write_submission(selected, args.output)
+        write_submission(
+            selected,
+            args.output,
+            jpeg_quality=args.jpeg_quality if args.transcode_jpeg else None,
+            jpeg_subsampling=subsampling_values[args.jpeg_subsampling],
+            max_size_bytes=max_size_bytes,
+        )
     except (FileNotFoundError, OSError, SubmissionError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
 
+    output_size_mb = args.output.resolve().stat().st_size / 1_000_000
     print(
         f"Wrote {args.output.resolve()} with {len(selected)} image(s) "
-        f"across {len(scene_dirs)} scene(s)."
+        f"across {len(scene_dirs)} scene(s), size {output_size_mb:.2f} MB."
     )
-    if args.filename_mode == "image-name":
+    if args.transcode_jpeg:
         print(
-            "Warning: image-name mode preserves CSV extensions; use the "
-            "default png mode for the PDF's PNG archive layout."
+            f"Images were encoded as RGB JPEG at quality {args.jpeg_quality}, "
+            f"subsampling {args.jpeg_subsampling}, using literal CSV names."
+        )
+    elif args.filename_mode == "image-name":
+        print(
+            "Warning: image-name mode changes archive names only; it does not "
+            "transcode PNG bytes. Add --transcode-jpeg for a real JPEG archive."
         )
     return 0
 
