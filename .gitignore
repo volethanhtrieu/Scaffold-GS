@@ -19,6 +19,7 @@ screenshots
 # Large local datasets and generated results
 /data/
 /output/
+/predictions/
 
 # Documents that should remain local
 *.pdf

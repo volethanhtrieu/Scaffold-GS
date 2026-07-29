@@ -23,6 +23,7 @@ from typing import (
     Union,
 )
 
+from arguments import str2bool
 from prepare_data import CSV_COLUMNS, discover_scenes, locate_test_pose_csv
 
 
@@ -260,6 +261,9 @@ def render_scene(
         add_opacity_dist=bool(config.get("add_opacity_dist", False)),
         add_cov_dist=bool(config.get("add_cov_dist", False)),
         add_color_dist=bool(config.get("add_color_dist", False)),
+        use_second_order=str2bool(config.get("use_second_order", False)),
+        num_eigenvectors=int(config.get("num_eigenvectors", 2)),
+        lambda_sgl=float(config.get("lambda_sgl", 0.01)),
     )
     model.load_ply_sparse_gaussian(str(iteration_dir / "point_cloud.ply"))
     model.load_mlp_checkpoints(str(iteration_dir))

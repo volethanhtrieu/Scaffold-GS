@@ -16,10 +16,10 @@ because the supplied sparse model also contains the withheld test views.
 `train.sh` also resolves a scene's nested `train/` directory automatically for
 the repository's existing single-scene commands.
 
-Run the read-only audit first:
+Run the environment verifier and read-only seven-scene audit first:
 
 ```bash
-python prepare_data.py
+scripts/verify_sogs_environment.sh --gpu 0 --data-root data
 ```
 
 On a primary GPU machine, train every scene sequentially (this command starts
@@ -33,6 +33,20 @@ The launcher uses all available training images by passing
 `data/<scene>/train` directly to `train.py`, saves models under
 `outputs/round1/<scene>/`, and skips the repository's held-out evaluation
 pass. Use `--dry-run` to inspect commands without starting a job.
+
+SOGS remains an explicit method choice; it does not alter the data or
+submission pipeline. Prepare (but do not run during repository migration) an
+opt-in competition command such as:
+
+```bash
+python train_competition.py --gpu 0 \
+  --use-second-order True --feat-dim 16 \
+  --num-eigenvectors 2 --lambda-sgl 0.01 --dry-run
+```
+
+Keep the generated `cfg_args`, `sogs_config.json`, checkpoint, and training
+log with each experiment so the organizer's reproducibility requirements can
+be met.
 
 Render the CSV test poses from the saved checkpoints:
 

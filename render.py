@@ -16,7 +16,16 @@ import numpy as np
 import subprocess
 cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
 result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
-os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
+memory_values = []
+for line in result[:-1]:
+    fields = line.split()
+    if len(fields) >= 3:
+        try:
+            memory_values.append(int(fields[2]))
+        except ValueError:
+            pass
+if memory_values:
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(np.argmin(memory_values))
 
 os.system('echo $CUDA_VISIBLE_DEVICES')
 
@@ -67,8 +76,23 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
      
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
     with torch.no_grad():
-        gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
+        gaussians = GaussianModel(
+            feat_dim=dataset.feat_dim,
+            n_offsets=dataset.n_offsets,
+            voxel_size=dataset.voxel_size,
+            update_depth=dataset.update_depth,
+            update_init_factor=dataset.update_init_factor,
+            update_hierachy_factor=dataset.update_hierachy_factor,
+            use_feat_bank=dataset.use_feat_bank,
+            appearance_dim=dataset.appearance_dim,
+            ratio=dataset.ratio,
+            add_opacity_dist=dataset.add_opacity_dist,
+            add_cov_dist=dataset.add_cov_dist,
+            add_color_dist=dataset.add_color_dist,
+            use_second_order=dataset.use_second_order,
+            num_eigenvectors=dataset.num_eigenvectors,
+            lambda_sgl=dataset.lambda_sgl,
+        )
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         
         gaussians.eval()

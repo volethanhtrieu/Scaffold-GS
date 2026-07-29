@@ -12,6 +12,95 @@
 from argparse import ArgumentParser, Namespace
 import sys
 import os
+import math
+import numbers
+
+
+def str2bool(value):
+    """Parse a boolean safely from CLI/config-friendly spellings.
+
+    ``type=bool`` is intentionally avoided because ``bool("False")`` is
+    ``True``.  The optional argument value also lets existing flags such as
+    ``--eval`` continue to mean ``True`` while accepting
+    ``--use_second_order False``.
+    """
+
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes", "y", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "n", "off"}:
+        return False
+    raise ValueError(
+        f"invalid boolean value {value!r}; expected True/False, 1/0, yes/no, or on/off"
+    )
+
+
+def validate_sogs_config(
+    feat_dim,
+    use_second_order=False,
+    num_eigenvectors=2,
+    lambda_sgl=0.01,
+):
+    """Validate explicit SOGS settings and return normalized values.
+
+    The function is deliberately independent of the parser so checkpoint and
+    renderer entry points can validate values loaded from ``cfg_args`` too.
+    """
+
+    if isinstance(feat_dim, bool) or (
+        not isinstance(feat_dim, (str, numbers.Integral))
+    ):
+        raise ValueError("feat_dim must be a positive integer")
+    try:
+        normalized_feat_dim = int(feat_dim)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("feat_dim must be a positive integer") from error
+    if normalized_feat_dim <= 0:
+        raise ValueError("feat_dim must be greater than zero")
+
+    try:
+        normalized_enabled = str2bool(use_second_order)
+    except (TypeError, ValueError) as error:
+        raise ValueError("use_second_order must be a boolean") from error
+
+    if isinstance(num_eigenvectors, bool) or (
+        not isinstance(num_eigenvectors, (str, numbers.Integral))
+    ):
+        raise ValueError("num_eigenvectors must be an integer")
+    try:
+        normalized_eigenvectors = int(num_eigenvectors)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("num_eigenvectors must be an integer") from error
+    if normalized_eigenvectors < 0:
+        raise ValueError("num_eigenvectors must be non-negative")
+    if normalized_enabled and normalized_eigenvectors < 1:
+        raise ValueError(
+            "num_eigenvectors must be at least 1 when use_second_order is True"
+        )
+    if normalized_eigenvectors > normalized_feat_dim:
+        raise ValueError(
+            "num_eigenvectors must not exceed feat_dim "
+            f"({normalized_eigenvectors} > {normalized_feat_dim})"
+        )
+
+    if isinstance(lambda_sgl, bool):
+        raise ValueError("lambda_sgl must be a non-negative number")
+    try:
+        normalized_lambda = float(lambda_sgl)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("lambda_sgl must be a non-negative number") from error
+    if not math.isfinite(normalized_lambda) or normalized_lambda < 0:
+        raise ValueError("lambda_sgl must be non-negative")
+
+    return (
+        normalized_feat_dim,
+        normalized_enabled,
+        normalized_eigenvectors,
+        normalized_lambda,
+    )
+
 
 class GroupParams:
     pass
@@ -28,12 +117,25 @@ class ParamGroup:
             value = value if not fill_none else None 
             if shorthand:
                 if t == bool:
-                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
+                    group.add_argument(
+                        "--" + key,
+                        ("-" + key[0:1]),
+                        default=value,
+                        nargs="?",
+                        const=True,
+                        type=str2bool,
+                    )
                 else:
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, type=t)
             else:
                 if t == bool:
-                    group.add_argument("--" + key, default=value, action="store_true")
+                    group.add_argument(
+                        "--" + key,
+                        default=value,
+                        nargs="?",
+                        const=True,
+                        type=str2bool,
+                    )
                 else:
                     group.add_argument("--" + key, default=value, type=t)
 
@@ -48,6 +150,11 @@ class ModelParams(ParamGroup):
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
         self.feat_dim = 32
+        # PAPER: SOGS is opt-in so the original Scaffold-GS path remains the
+        # default.  M=2 and lambda=.01 are the paper's reference settings.
+        self.use_second_order = False
+        self.num_eigenvectors = 2
+        self.lambda_sgl = 0.01
         self.n_offsets = 10
         self.voxel_size =  0.001 # if voxel_size<=0, using 1nn dist
         self.update_depth = 3
@@ -80,6 +187,27 @@ class ModelParams(ParamGroup):
 
     def extract(self, args):
         g = super().extract(args)
+        # ``sentinel=True`` is used by render.py; fill missing fields from
+        # stable baseline/reference defaults when loading an old cfg_args.
+        if getattr(g, "feat_dim", None) is None:
+            g.feat_dim = 32
+        if getattr(g, "use_second_order", None) is None:
+            g.use_second_order = False
+        if getattr(g, "num_eigenvectors", None) is None:
+            g.num_eigenvectors = 2
+        if getattr(g, "lambda_sgl", None) is None:
+            g.lambda_sgl = 0.01
+        (
+            g.feat_dim,
+            g.use_second_order,
+            g.num_eigenvectors,
+            g.lambda_sgl,
+        ) = validate_sogs_config(
+            g.feat_dim,
+            g.use_second_order,
+            g.num_eigenvectors,
+            g.lambda_sgl,
+        )
         g.source_path = os.path.abspath(g.source_path)
         return g
 

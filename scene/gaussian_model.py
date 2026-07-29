@@ -12,6 +12,7 @@
 import torch
 from functools import reduce
 import numpy as np
+import json
 from torch_scatter import scatter_max
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func
 from torch import nn
@@ -22,6 +23,11 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.embedding import Embedding
+from utils.sogs_utils import (
+    SecondOrderFeatureAugmentor,
+    validate_second_order_dimensions,
+)
+from arguments import validate_sogs_config
 
     
 class GaussianModel:
@@ -57,9 +63,33 @@ class GaussianModel:
                  add_opacity_dist : bool = False,
                  add_cov_dist : bool = False,
                  add_color_dist : bool = False,
+                 use_second_order: bool = False,
+                 num_eigenvectors: int = 2,
+                 lambda_sgl: float = 0.01,
+                 device=None,
                  ):
 
-        self.feat_dim = feat_dim
+        # COMPATIBILITY: append SOGS settings after the original positional
+        # arguments so existing Scaffold-GS callers remain valid.
+        (
+            self.feat_dim,
+            self.use_second_order,
+            self.num_eigenvectors,
+            self.lambda_sgl,
+        ) = validate_sogs_config(
+            feat_dim,
+            use_second_order,
+            num_eigenvectors,
+            lambda_sgl,
+        )
+        validate_second_order_dimensions(
+            self.feat_dim,
+            self.num_eigenvectors,
+            enabled=self.use_second_order,
+        )
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(device)
         self.n_offsets = n_offsets
         self.voxel_size = voxel_size
         self.update_depth = update_depth
@@ -74,65 +104,92 @@ class GaussianModel:
         self.add_cov_dist = add_cov_dist
         self.add_color_dist = add_color_dist
 
-        self._anchor = torch.empty(0)
-        self._offset = torch.empty(0)
-        self._anchor_feat = torch.empty(0)
+        self._anchor = torch.empty(0, device=self.device)
+        self._offset = torch.empty(0, device=self.device)
+        self._anchor_feat = torch.empty(0, device=self.device)
         
-        self.opacity_accum = torch.empty(0)
+        self.opacity_accum = torch.empty(0, device=self.device)
 
-        self._scaling = torch.empty(0)
-        self._rotation = torch.empty(0)
-        self._opacity = torch.empty(0)
-        self.max_radii2D = torch.empty(0)
+        self._scaling = torch.empty(0, device=self.device)
+        self._rotation = torch.empty(0, device=self.device)
+        self._opacity = torch.empty(0, device=self.device)
+        self.max_radii2D = torch.empty(0, device=self.device)
         
-        self.offset_gradient_accum = torch.empty(0)
-        self.offset_denom = torch.empty(0)
+        self.offset_gradient_accum = torch.empty(0, device=self.device)
+        self.offset_denom = torch.empty(0, device=self.device)
 
-        self.anchor_demon = torch.empty(0)
+        self.anchor_demon = torch.empty(0, device=self.device)
+        # COMPATIBILITY: legacy capture() referenced these names without
+        # initializing them in this local fork.
+        self._local = torch.empty(0, device=self.device)
+        self.denom = torch.empty(0, device=self.device)
+        self.active_sh_degree = 0
                 
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
 
+        self.render_feat_dim = self.feat_dim * (
+            1 + self.num_eigenvectors if self.use_second_order else 1
+        )
+        # PAPER: learn one two-layer branch per selected eigenvector and
+        # concatenate branch outputs with the original anchor feature.
+        self.second_order_augmentor = (
+            SecondOrderFeatureAugmentor(
+                self.feat_dim, self.num_eigenvectors
+            ).to(self.device)
+            if self.use_second_order
+            else None
+        )
+
         if self.use_feat_bank:
             self.mlp_feature_bank = nn.Sequential(
-                nn.Linear(3+1, feat_dim),
+                nn.Linear(3+1, self.feat_dim),
                 nn.ReLU(True),
-                nn.Linear(feat_dim, 3),
+                nn.Linear(self.feat_dim, 3),
                 nn.Softmax(dim=1)
-            ).cuda()
+            ).to(self.device)
 
         self.opacity_dist_dim = 1 if self.add_opacity_dist else 0
         self.mlp_opacity = nn.Sequential(
-            nn.Linear(feat_dim+3+self.opacity_dist_dim, feat_dim),
+            nn.Linear(
+                self.render_feat_dim+3+self.opacity_dist_dim, self.feat_dim
+            ),
             nn.ReLU(True),
-            nn.Linear(feat_dim, n_offsets),
+            nn.Linear(self.feat_dim, n_offsets),
             nn.Tanh()
-        ).cuda()
+        ).to(self.device)
 
         self.add_cov_dist = add_cov_dist
         self.cov_dist_dim = 1 if self.add_cov_dist else 0
         self.mlp_cov = nn.Sequential(
-            nn.Linear(feat_dim+3+self.cov_dist_dim, feat_dim),
+            nn.Linear(
+                self.render_feat_dim+3+self.cov_dist_dim, self.feat_dim
+            ),
             nn.ReLU(True),
-            nn.Linear(feat_dim, 7*self.n_offsets),
-        ).cuda()
+            nn.Linear(self.feat_dim, 7*self.n_offsets),
+        ).to(self.device)
 
         self.color_dist_dim = 1 if self.add_color_dist else 0
         self.mlp_color = nn.Sequential(
-            nn.Linear(feat_dim+3+self.color_dist_dim+self.appearance_dim, feat_dim),
+            nn.Linear(
+                self.render_feat_dim+3+self.color_dist_dim+self.appearance_dim,
+                self.feat_dim,
+            ),
             nn.ReLU(True),
-            nn.Linear(feat_dim, 3*self.n_offsets),
+            nn.Linear(self.feat_dim, 3*self.n_offsets),
             nn.Sigmoid()
-        ).cuda()
+        ).to(self.device)
 
 
     def eval(self):
         self.mlp_opacity.eval()
         self.mlp_cov.eval()
         self.mlp_color.eval()
-        if self.appearance_dim > 0:
+        if self.second_order_augmentor is not None:
+            self.second_order_augmentor.eval()
+        if self.appearance_dim > 0 and self.embedding_appearance is not None:
             self.embedding_appearance.eval()
         if self.use_feat_bank:
             self.mlp_feature_bank.eval()
@@ -141,44 +198,402 @@ class GaussianModel:
         self.mlp_opacity.train()
         self.mlp_cov.train()
         self.mlp_color.train()
-        if self.appearance_dim > 0:
+        if self.second_order_augmentor is not None:
+            self.second_order_augmentor.train()
+        if self.appearance_dim > 0 and self.embedding_appearance is not None:
             self.embedding_appearance.train()
         if self.use_feat_bank:                   
             self.mlp_feature_bank.train()
 
+    @property
+    def get_render_feature_dim(self):
+        """Return the feature width consumed by the attribute MLPs."""
+
+        return self.render_feat_dim
+
+    def get_render_features(self):
+        """Return base or second-order-augmented anchor features.
+
+        The returned tensor has shape ``[N, D]`` for Scaffold-GS and
+        ``[N, D * (1 + M)]`` for SOGS.  Statistics are intentionally computed
+        before renderer visibility masking so the correlation patterns remain
+        scene-global rather than view-dependent.
+        """
+
+        features = self._anchor_feat
+        if features.numel() == 0:
+            return features.reshape(0, self.render_feat_dim)
+        if features.ndim != 2 or features.shape[1] != self.feat_dim:
+            raise RuntimeError(
+                "anchor feature tensor must have shape "
+                f"[N, {self.feat_dim}], received {tuple(features.shape)}"
+            )
+        if not self.use_second_order:
+            expected_dim = self.feat_dim
+            assert features.shape[-1] == expected_dim
+            return features
+        if self.second_order_augmentor is None:
+            raise RuntimeError(
+                "SOGS is enabled but its second-order augmentor is not initialized"
+            )
+        # PAPER: expose one feature path to every renderer consumer.
+        augmented_features = self.second_order_augmentor(features)
+        expected_dim = self.feat_dim * (1 + self.num_eigenvectors)
+        assert augmented_features.shape[-1] == expected_dim
+        return augmented_features
+
+    def get_sogs_config(self):
+        """Return serializable SOGS settings for configs/checkpoint metadata."""
+
+        return {
+            "use_second_order": bool(self.use_second_order),
+            "num_eigenvectors": int(self.num_eigenvectors),
+            "lambda_sgl": float(self.lambda_sgl),
+            "feat_dim": int(self.feat_dim),
+            "render_feat_dim": int(self.render_feat_dim),
+        }
+
+    def _assert_checkpoint_compatible(self, checkpoint_config, *, source="checkpoint"):
+        """Reject architecture/configuration mismatches instead of random state."""
+
+        if checkpoint_config is None:
+            if self.use_second_order:
+                raise RuntimeError(
+                    f"{source} does not record SOGS configuration; "
+                    "cannot safely load it with use_second_order=True"
+                )
+            return
+        if not isinstance(checkpoint_config, dict):
+            raise RuntimeError(
+                f"{source} has an invalid SOGS configuration; expected an object"
+            )
+        if not checkpoint_config:
+            if self.use_second_order:
+                raise RuntimeError(
+                    f"{source} does not record SOGS configuration; "
+                    "cannot safely load it with use_second_order=True"
+                )
+            return
+        expected = self.get_sogs_config()
+        for key in (
+            "use_second_order",
+            "num_eigenvectors",
+            "lambda_sgl",
+            "feat_dim",
+            "render_feat_dim",
+        ):
+            if key not in checkpoint_config:
+                if self.use_second_order:
+                    raise RuntimeError(
+                        f"{source} is missing required SOGS setting {key!r}"
+                    )
+                continue
+            actual = checkpoint_config[key]
+            if key == "lambda_sgl":
+                try:
+                    matches = abs(float(actual) - expected[key]) <= 1e-12
+                except (TypeError, ValueError) as error:
+                    raise RuntimeError(
+                        f"invalid {source} setting lambda_sgl={actual!r}"
+                    ) from error
+            else:
+                matches = actual == expected[key]
+            if not matches:
+                raise RuntimeError(
+                    f"incompatible {source} setting {key}: "
+                    f"checkpoint={actual!r}, requested={expected[key]!r}"
+                )
+
+    @staticmethod
+    def _load_module_state(module, state, name):
+        if state is None:
+            raise RuntimeError(f"checkpoint is missing state for {name}")
+        try:
+            module.load_state_dict(state, strict=True)
+        except (RuntimeError, KeyError) as error:
+            raise RuntimeError(f"incompatible state for {name}: {error}") from error
+
+    def _mlp_state(self):
+        state = {
+            "opacity_mlp": self.mlp_opacity.state_dict(),
+            "cov_mlp": self.mlp_cov.state_dict(),
+            "color_mlp": self.mlp_color.state_dict(),
+        }
+        if self.use_feat_bank:
+            state["feature_bank_mlp"] = self.mlp_feature_bank.state_dict()
+        if self.appearance_dim > 0 and self.embedding_appearance is not None:
+            state["appearance"] = self.embedding_appearance.state_dict()
+        if self.second_order_augmentor is not None:
+            state["second_order"] = self.second_order_augmentor.state_dict()
+        return state
+
     def capture(self):
-        return (
-            self._anchor,
-            self._offset,
-            self._local,
-            self._scaling,
-            self._rotation,
-            self._opacity,
-            self.max_radii2D,
-            self.denom,
-            self.optimizer.state_dict(),
-            self.spatial_lr_scale,
-        )
+        """Capture model, SOGS modules, optimizer, and compatibility metadata.
+
+        A dictionary is used for new checkpoints.  ``restore`` still accepts
+        the original Scaffold-GS positional tuple so old checkpoints can be
+        loaded in baseline mode.
+        """
+
+        return {
+            "format_version": 2,
+            "config": self.get_sogs_config(),
+            "active_sh_degree": int(self.active_sh_degree),
+            "tensors": {
+                "anchor": self._anchor,
+                "offset": self._offset,
+                "anchor_feat": self._anchor_feat,
+                "local": self._local,
+                "scaling": self._scaling,
+                "rotation": self._rotation,
+                "opacity": self._opacity,
+                "max_radii2D": self.max_radii2D,
+                "denom": self.denom,
+            },
+            "parameter_requires_grad": {
+                name: bool(getattr(self, "_" + name).requires_grad)
+                for name in (
+                    "anchor",
+                    "offset",
+                    "anchor_feat",
+                    "scaling",
+                    "rotation",
+                    "opacity",
+                )
+            },
+            "mlp": self._mlp_state(),
+            "optimizer": (
+                self.optimizer.state_dict() if self.optimizer is not None else None
+            ),
+            "training_statistics": {
+                "opacity_accum": self.opacity_accum,
+                "offset_gradient_accum": self.offset_gradient_accum,
+                "offset_denom": self.offset_denom,
+                "anchor_demon": self.anchor_demon,
+            },
+            "spatial_lr_scale": self.spatial_lr_scale,
+        }
     
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._anchor, 
-        self._offset,
-        self._local,
-        self._scaling, 
-        self._rotation, 
-        self._opacity,
-        self.max_radii2D, 
-        denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
+        """Restore a new structured checkpoint or a legacy Scaffold-GS tuple."""
+
+        if isinstance(model_args, dict) and "tensors" in model_args:
+            if model_args.get("format_version") != 2:
+                raise RuntimeError(
+                    "unsupported structured checkpoint format; "
+                    "expected format_version=2"
+                )
+            self._assert_checkpoint_compatible(
+                model_args.get("config"), source="model checkpoint"
+            )
+            tensors = model_args["tensors"]
+            if not isinstance(tensors, dict):
+                raise RuntimeError(
+                    "model checkpoint has invalid tensor state; expected an object"
+                )
+            required = (
+                "anchor",
+                "offset",
+                "anchor_feat",
+                "scaling",
+                "rotation",
+                "opacity",
+                "max_radii2D",
+                "denom",
+            )
+            missing = [name for name in required if name not in tensors]
+            if missing:
+                raise RuntimeError(
+                    "model checkpoint is missing tensor state: " + ", ".join(missing)
+                )
+            invalid = [
+                name
+                for name in required
+                if not isinstance(tensors.get(name), torch.Tensor)
+            ]
+            if invalid:
+                raise RuntimeError(
+                    "model checkpoint has non-tensor state for: "
+                    + ", ".join(invalid)
+                )
+            parameter_names = {
+                "anchor",
+                "offset",
+                "anchor_feat",
+                "scaling",
+                "rotation",
+                "opacity",
+            }
+            requires_grad = model_args.get("parameter_requires_grad", {})
+            if requires_grad is None:
+                requires_grad = {}
+            if not isinstance(requires_grad, dict):
+                raise RuntimeError(
+                    "model checkpoint has invalid parameter_requires_grad metadata"
+                )
+            self.active_sh_degree = int(
+                model_args.get("active_sh_degree", self.active_sh_degree)
+            )
+            for name, tensor in tensors.items():
+                if tensor is None:
+                    continue
+                value = tensor.to(self.device)
+                if name in parameter_names:
+                    value = nn.Parameter(
+                        value.requires_grad_(
+                            bool(
+                                requires_grad.get(
+                                    name, name not in {"rotation", "opacity"}
+                                )
+                            )
+                        )
+                    )
+                attribute = (
+                    "_" + name
+                    if name in parameter_names
+                    else "_local"
+                    if name == "local"
+                    else name
+                )
+                setattr(self, attribute, value)
+            mlp_state = model_args.get("mlp", {})
+            if not isinstance(mlp_state, dict):
+                raise RuntimeError(
+                    "model checkpoint has invalid MLP state; expected an object"
+                )
+            self._load_module_state(
+                self.mlp_opacity, mlp_state.get("opacity_mlp"), "opacity_mlp"
+            )
+            self._load_module_state(
+                self.mlp_cov, mlp_state.get("cov_mlp"), "cov_mlp"
+            )
+            self._load_module_state(
+                self.mlp_color, mlp_state.get("color_mlp"), "color_mlp"
+            )
+            if self.second_order_augmentor is not None:
+                self._load_module_state(
+                    self.second_order_augmentor,
+                    mlp_state.get("second_order"),
+                    "second_order_augmentor",
+                )
+            if self.use_feat_bank:
+                self._load_module_state(
+                    self.mlp_feature_bank,
+                    mlp_state.get("feature_bank_mlp"),
+                    "feature_bank_mlp",
+                )
+            if self.appearance_dim > 0:
+                if self.embedding_appearance is None:
+                    raise RuntimeError(
+                        "appearance embedding must be initialized before restoring "
+                        "a checkpoint with appearance_dim > 0"
+                    )
+                self._load_module_state(
+                    self.embedding_appearance,
+                    mlp_state.get("appearance"),
+                    "appearance_embedding",
+                )
+            self._local = tensors.get("local", self._local).to(self.device)
+            self.denom = tensors.get("denom", self.denom).to(self.device)
+            self.spatial_lr_scale = model_args.get(
+                "spatial_lr_scale", self.spatial_lr_scale
+            )
+            self.training_setup(training_args)
+            for name, tensor in model_args.get(
+                "training_statistics", {}
+            ).items():
+                if isinstance(tensor, torch.Tensor):
+                    setattr(self, name, tensor.to(self.device))
+            optimizer_state = model_args.get("optimizer")
+            if optimizer_state is not None:
+                try:
+                    self.optimizer.load_state_dict(optimizer_state)
+                except (RuntimeError, ValueError) as error:
+                    raise RuntimeError(
+                        f"incompatible optimizer state in model checkpoint: {error}"
+                    ) from error
+            return
+
+        # COMPATIBILITY: legacy local checkpoints were a positional tuple.
+        if not isinstance(model_args, (tuple, list)) or len(model_args) < 10:
+            raise RuntimeError("unsupported Scaffold-GS checkpoint format")
+        if len(model_args) >= 11:
+            (
+                self.active_sh_degree,
+                self._anchor,
+                self._offset,
+                self._local,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self.max_radii2D,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale,
+            ) = model_args[:11]
+        else:
+            (
+                self._anchor,
+                self._offset,
+                self._local,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self.max_radii2D,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale,
+            ) = model_args
+        if self.use_second_order:
+            raise RuntimeError(
+                "legacy Scaffold-GS checkpoints do not contain SOGS modules; "
+                "reload with use_second_order=False or retrain"
+            )
+        self._anchor = nn.Parameter(
+            self._anchor.to(self.device).requires_grad_(True)
+        )
+        self._offset = nn.Parameter(
+            self._offset.to(self.device).requires_grad_(True)
+        )
+        legacy_local = self._local.to(self.device)
+        if (
+            legacy_local.ndim == 2
+            and legacy_local.shape[0] == self._anchor.shape[0]
+            and legacy_local.shape[1] == self.feat_dim
+        ):
+            # COMPATIBILITY: upstream/local legacy variants used the third
+            # tuple slot for the anchor feature under different names.
+            self._anchor_feat = nn.Parameter(legacy_local.requires_grad_(True))
+            self._local = torch.empty(0, device=self.device)
+        elif self._anchor_feat.shape != (
+            self._anchor.shape[0],
+            self.feat_dim,
+        ):
+            raise RuntimeError(
+                "legacy checkpoint has no restorable anchor feature tensor"
+            )
+        else:
+            self._local = legacy_local
+        self._scaling = nn.Parameter(
+            self._scaling.to(self.device).requires_grad_(True)
+        )
+        self._rotation = nn.Parameter(
+            self._rotation.to(self.device).requires_grad_(False)
+        )
+        self._opacity = nn.Parameter(
+            self._opacity.to(self.device).requires_grad_(False)
+        )
+        self.max_radii2D = self.max_radii2D.to(self.device)
+        self.denom = denom.to(self.device)
         self.training_setup(training_args)
-        self.denom = denom
-        self.optimizer.load_state_dict(opt_dict)
+        if opt_dict is not None:
+            self.optimizer.load_state_dict(opt_dict)
 
     def set_appearance(self, num_cameras):
         if self.appearance_dim > 0:
-            self.embedding_appearance = Embedding(num_cameras, self.appearance_dim).cuda()
+            self.embedding_appearance = Embedding(
+                num_cameras, self.appearance_dim
+            ).to(self.device)
 
     @property
     def get_appearance(self):
@@ -237,8 +652,8 @@ class GaussianModel:
         points = pcd.points[::self.ratio]
 
         if self.voxel_size <= 0:
-            init_points = torch.tensor(points).float().cuda()
-            init_dist = distCUDA2(init_points).float().cuda()
+            init_points = torch.tensor(points, device=self.device).float()
+            init_dist = distCUDA2(init_points).float().to(self.device)
             median_dist, _ = torch.kthvalue(init_dist, int(init_dist.shape[0]*0.5))
             self.voxel_size = median_dist.item()
             del init_dist
@@ -249,19 +664,36 @@ class GaussianModel:
         
         
         points = self.voxelize_sample(points, voxel_size=self.voxel_size)
-        fused_point_cloud = torch.tensor(np.asarray(points)).float().cuda()
-        offsets = torch.zeros((fused_point_cloud.shape[0], self.n_offsets, 3)).float().cuda()
-        anchors_feat = torch.zeros((fused_point_cloud.shape[0], self.feat_dim)).float().cuda()
+        fused_point_cloud = torch.tensor(
+            np.asarray(points), device=self.device
+        ).float()
+        offsets = torch.zeros(
+            (fused_point_cloud.shape[0], self.n_offsets, 3), device=self.device
+        ).float()
+        anchors_feat = torch.zeros(
+            (fused_point_cloud.shape[0], self.feat_dim), device=self.device
+        ).float()
         
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        dist2 = torch.clamp_min(distCUDA2(fused_point_cloud).float().cuda(), 0.0000001)
+        dist2 = torch.clamp_min(
+            distCUDA2(fused_point_cloud).float().to(self.device), 0.0000001
+        )
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 6)
         
-        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots = torch.zeros(
+            (fused_point_cloud.shape[0], 4), device=self.device
+        )
         rots[:, 0] = 1
 
-        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        opacities = inverse_sigmoid(
+            0.1
+            * torch.ones(
+                (fused_point_cloud.shape[0], 1),
+                dtype=torch.float,
+                device=self.device,
+            )
+        )
 
         self._anchor = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._offset = nn.Parameter(offsets.requires_grad_(True))
@@ -269,62 +701,110 @@ class GaussianModel:
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(False))
         self._opacity = nn.Parameter(opacities.requires_grad_(False))
-        self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+        self.max_radii2D = torch.zeros(
+            (self.get_anchor.shape[0]), device=self.device
+        )
 
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
 
-        self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+        self.opacity_accum = torch.zeros(
+            (self.get_anchor.shape[0], 1), device=self.device
+        )
 
-        self.offset_gradient_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
-        self.offset_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
-        self.anchor_demon = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+        self.offset_gradient_accum = torch.zeros(
+            (self.get_anchor.shape[0] * self.n_offsets, 1), device=self.device
+        )
+        self.offset_denom = torch.zeros(
+            (self.get_anchor.shape[0] * self.n_offsets, 1), device=self.device
+        )
+        self.anchor_demon = torch.zeros(
+            (self.get_anchor.shape[0], 1), device=self.device
+        )
 
-        
-        
+        l = [
+            {
+                "params": [self._anchor],
+                "lr": training_args.position_lr_init * self.spatial_lr_scale,
+                "name": "anchor",
+            },
+            {
+                "params": [self._offset],
+                "lr": training_args.offset_lr_init * self.spatial_lr_scale,
+                "name": "offset",
+            },
+            {
+                "params": [self._anchor_feat],
+                "lr": training_args.feature_lr,
+                "name": "anchor_feat",
+            },
+            {
+                "params": [self._opacity],
+                "lr": training_args.opacity_lr,
+                "name": "opacity",
+            },
+            {
+                "params": [self._scaling],
+                "lr": training_args.scaling_lr,
+                "name": "scaling",
+            },
+            {
+                "params": [self._rotation],
+                "lr": training_args.rotation_lr,
+                "name": "rotation",
+            },
+            {
+                "params": self.mlp_opacity.parameters(),
+                "lr": training_args.mlp_opacity_lr_init,
+                "name": "mlp_opacity",
+            },
+        ]
         if self.use_feat_bank:
-            l = [
-                {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
-                {'params': [self._offset], 'lr': training_args.offset_lr_init * self.spatial_lr_scale, "name": "offset"},
-                {'params': [self._anchor_feat], 'lr': training_args.feature_lr, "name": "anchor_feat"},
-                {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
-                {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-                {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
-                
-                {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
-                {'params': self.mlp_feature_bank.parameters(), 'lr': training_args.mlp_featurebank_lr_init, "name": "mlp_featurebank"},
-                {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
-                {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
-                {'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"},
+            l.append(
+                {
+                    "params": self.mlp_feature_bank.parameters(),
+                    "lr": training_args.mlp_featurebank_lr_init,
+                    "name": "mlp_featurebank",
+                }
+            )
+        l.extend(
+            [
+                {
+                    "params": self.mlp_cov.parameters(),
+                    "lr": training_args.mlp_cov_lr_init,
+                    "name": "mlp_cov",
+                },
+                {
+                    "params": self.mlp_color.parameters(),
+                    "lr": training_args.mlp_color_lr_init,
+                    "name": "mlp_color",
+                },
             ]
-        elif self.appearance_dim > 0:
-            l = [
-                {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
-                {'params': [self._offset], 'lr': training_args.offset_lr_init * self.spatial_lr_scale, "name": "offset"},
-                {'params': [self._anchor_feat], 'lr': training_args.feature_lr, "name": "anchor_feat"},
-                {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
-                {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-                {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
-
-                {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
-                {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
-                {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
-                {'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"},
-            ]
-        else:
-            l = [
-                {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
-                {'params': [self._offset], 'lr': training_args.offset_lr_init * self.spatial_lr_scale, "name": "offset"},
-                {'params': [self._anchor_feat], 'lr': training_args.feature_lr, "name": "anchor_feat"},
-                {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
-                {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-                {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
-
-                {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
-                {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
-                {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
-            ]
+        )
+        # PAPER: Fi modules are trainable and therefore must have an optimizer
+        # parameter group.  The paper does not specify a separate schedule;
+        # reuse the anchor feature learning rate.
+        if self.second_order_augmentor is not None:
+            l.append(
+                {
+                    "params": self.second_order_augmentor.parameters(),
+                    "lr": training_args.feature_lr,
+                    "name": "mlp_second_order",
+                }
+            )
+        if self.appearance_dim > 0:
+            if self.embedding_appearance is None:
+                raise RuntimeError(
+                    "appearance_dim > 0 requires set_appearance() before training_setup()"
+                )
+            l.append(
+                {
+                    "params": self.embedding_appearance.parameters(),
+                    "lr": training_args.appearance_lr_init,
+                    "name": "embedding_appearance",
+                }
+            )
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.anchor_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -442,6 +922,11 @@ class GaussianModel:
         # anchor_feat
         anchor_feat_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_anchor_feat")]
         anchor_feat_names = sorted(anchor_feat_names, key = lambda x: int(x.split('_')[-1]))
+        if len(anchor_feat_names) != self.feat_dim:
+            raise RuntimeError(
+                "incompatible PLY anchor feature dimension: "
+                f"checkpoint={len(anchor_feat_names)}, requested={self.feat_dim}"
+            )
         anchor_feats = np.zeros((anchor.shape[0], len(anchor_feat_names)))
         for idx, attr_name in enumerate(anchor_feat_names):
             anchor_feats[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
@@ -453,13 +938,37 @@ class GaussianModel:
             offsets[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
         offsets = offsets.reshape((offsets.shape[0], 3, -1))
         
-        self._anchor_feat = nn.Parameter(torch.tensor(anchor_feats, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._anchor_feat = nn.Parameter(
+            torch.tensor(
+                anchor_feats, dtype=torch.float, device=self.device
+            ).requires_grad_(True)
+        )
 
-        self._offset = nn.Parameter(torch.tensor(offsets, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
-        self._anchor = nn.Parameter(torch.tensor(anchor, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._offset = nn.Parameter(
+            torch.tensor(
+                offsets, dtype=torch.float, device=self.device
+            ).transpose(1, 2).contiguous().requires_grad_(True)
+        )
+        self._anchor = nn.Parameter(
+            torch.tensor(
+                anchor, dtype=torch.float, device=self.device
+            ).requires_grad_(True)
+        )
+        self._opacity = nn.Parameter(
+            torch.tensor(
+                opacities, dtype=torch.float, device=self.device
+            ).requires_grad_(True)
+        )
+        self._scaling = nn.Parameter(
+            torch.tensor(
+                scales, dtype=torch.float, device=self.device
+            ).requires_grad_(True)
+        )
+        self._rotation = nn.Parameter(
+            torch.tensor(
+                rots, dtype=torch.float, device=self.device
+            ).requires_grad_(True)
+        )
 
 
     def replace_tensor_to_optimizer(self, tensor, name):
@@ -591,7 +1100,7 @@ class GaussianModel:
             
             # random pick
             rand_mask = torch.rand_like(candidate_mask.float())>(0.5**(i+1))
-            rand_mask = rand_mask.cuda()
+            rand_mask = rand_mask.to(candidate_mask.device)
             candidate_mask = torch.logical_and(candidate_mask, rand_mask)
             
             length_inc = self.get_anchor.shape[0]*self.n_offsets - init_length
@@ -599,7 +1108,17 @@ class GaussianModel:
                 if i > 0:
                     continue
             else:
-                candidate_mask = torch.cat([candidate_mask, torch.zeros(length_inc, dtype=torch.bool, device='cuda')], dim=0)
+                candidate_mask = torch.cat(
+                    [
+                        candidate_mask,
+                        torch.zeros(
+                            length_inc,
+                            dtype=torch.bool,
+                            device=candidate_mask.device,
+                        ),
+                    ],
+                    dim=0,
+                )
 
             all_xyz = self.get_anchor.unsqueeze(dim=1) + self._offset * self.get_scaling[:,:3].unsqueeze(dim=1)
             
@@ -635,18 +1154,35 @@ class GaussianModel:
 
             
             if candidate_anchor.shape[0] > 0:
-                new_scaling = torch.ones_like(candidate_anchor).repeat([1,2]).float().cuda()*cur_size # *0.05
+                new_scaling = (
+                    torch.ones_like(candidate_anchor)
+                    .repeat([1, 2])
+                    .float()
+                    * cur_size
+                )  # *0.05
                 new_scaling = torch.log(new_scaling)
                 new_rotation = torch.zeros([candidate_anchor.shape[0], 4], device=candidate_anchor.device).float()
                 new_rotation[:,0] = 1.0
 
-                new_opacities = inverse_sigmoid(0.1 * torch.ones((candidate_anchor.shape[0], 1), dtype=torch.float, device="cuda"))
+                new_opacities = inverse_sigmoid(
+                    0.1
+                    * torch.ones(
+                        (candidate_anchor.shape[0], 1),
+                        dtype=torch.float,
+                        device=candidate_anchor.device,
+                    )
+                )
 
                 new_feat = self._anchor_feat.unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).view([-1, self.feat_dim])[candidate_mask]
 
                 new_feat = scatter_max(new_feat, inverse_indices.unsqueeze(1).expand(-1, new_feat.size(1)), dim=0)[0][remove_duplicates]
 
-                new_offsets = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1,self.n_offsets,1]).float().cuda()
+                new_offsets = (
+                    torch.zeros_like(candidate_anchor)
+                    .unsqueeze(dim=1)
+                    .repeat([1, self.n_offsets, 1])
+                    .float()
+                )
 
                 d = {
                     "anchor": candidate_anchor,
@@ -658,11 +1194,29 @@ class GaussianModel:
                 }
                 
 
-                temp_anchor_demon = torch.cat([self.anchor_demon, torch.zeros([new_opacities.shape[0], 1], device='cuda').float()], dim=0)
+                temp_anchor_demon = torch.cat(
+                    [
+                        self.anchor_demon,
+                        torch.zeros(
+                            [new_opacities.shape[0], 1],
+                            device=self.anchor_demon.device,
+                        ).float(),
+                    ],
+                    dim=0,
+                )
                 del self.anchor_demon
                 self.anchor_demon = temp_anchor_demon
 
-                temp_opacity_accum = torch.cat([self.opacity_accum, torch.zeros([new_opacities.shape[0], 1], device='cuda').float()], dim=0)
+                temp_opacity_accum = torch.cat(
+                    [
+                        self.opacity_accum,
+                        torch.zeros(
+                            [new_opacities.shape[0], 1],
+                            device=self.opacity_accum.device,
+                        ).float(),
+                    ],
+                    dim=0,
+                )
                 del self.opacity_accum
                 self.opacity_accum = temp_opacity_accum
 
@@ -718,8 +1272,12 @@ class GaussianModel:
         
         # update opacity accum 
         if anchors_mask.sum()>0:
-            self.opacity_accum[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
-            self.anchor_demon[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
+            self.opacity_accum[anchors_mask] = torch.zeros(
+                [anchors_mask.sum(), 1], device=self.opacity_accum.device
+            ).float()
+            self.anchor_demon[anchors_mask] = torch.zeros(
+                [anchors_mask.sum(), 1], device=self.anchor_demon.device
+            ).float()
         
         temp_opacity_accum = self.opacity_accum[~prune_mask]
         del self.opacity_accum
@@ -732,81 +1290,270 @@ class GaussianModel:
         if prune_mask.shape[0]>0:
             self.prune_anchor(prune_mask)
         
-        self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+        self.max_radii2D = torch.zeros(
+            (self.get_anchor.shape[0]), device=self.get_anchor.device
+        )
 
-    def save_mlp_checkpoints(self, path, mode = 'split'):#split or unite
-        mkdir_p(os.path.dirname(path))
-        if mode == 'split':
-            self.mlp_opacity.eval()
-            opacity_mlp = torch.jit.trace(self.mlp_opacity, (torch.rand(1, self.feat_dim+3+self.opacity_dist_dim).cuda()))
-            opacity_mlp.save(os.path.join(path, 'opacity_mlp.pt'))
-            self.mlp_opacity.train()
+    def _write_sogs_metadata(self, path):
+        """Write architecture/configuration metadata beside every saved model."""
 
-            self.mlp_cov.eval()
-            cov_mlp = torch.jit.trace(self.mlp_cov, (torch.rand(1, self.feat_dim+3+self.cov_dist_dim).cuda()))
-            cov_mlp.save(os.path.join(path, 'cov_mlp.pt'))
-            self.mlp_cov.train()
+        metadata_path = os.path.join(path, "sogs_config.json")
+        metadata = {
+            "format_version": 2,
+            "sogs": self.get_sogs_config(),
+        }
+        with open(metadata_path, "w") as metadata_file:
+            json.dump(metadata, metadata_file, indent=2, sort_keys=True)
 
-            self.mlp_color.eval()
-            color_mlp = torch.jit.trace(self.mlp_color, (torch.rand(1, self.feat_dim+3+self.color_dist_dim+self.appearance_dim).cuda()))
-            color_mlp.save(os.path.join(path, 'color_mlp.pt'))
-            self.mlp_color.train()
+    def _read_sogs_metadata(self, path):
+        metadata_path = os.path.join(path, "sogs_config.json")
+        if not os.path.isfile(metadata_path):
+            if self.use_second_order:
+                raise RuntimeError(
+                    f"missing SOGS metadata at {metadata_path}; "
+                    "the checkpoint cannot be loaded in SOGS mode"
+                )
+            return {}
+        try:
+            with open(metadata_path, "r") as metadata_file:
+                metadata = json.load(metadata_file)
+        except (OSError, ValueError) as error:
+            raise RuntimeError(
+                f"could not read checkpoint metadata {metadata_path}: {error}"
+            ) from error
+        if not isinstance(metadata, dict) or metadata.get("format_version") != 2:
+            raise RuntimeError(
+                f"unsupported checkpoint metadata format in {metadata_path}; "
+                "expected format_version=2"
+            )
+        config = metadata.get("sogs", metadata.get("config"))
+        if not isinstance(config, dict):
+            raise RuntimeError(
+                f"checkpoint metadata {metadata_path} has no SOGS configuration"
+            )
+        self._assert_checkpoint_compatible(config, source=metadata_path)
+        return config
+
+    def save_mlp_checkpoints(self, path, mode="split"):
+        """Save attribute and SOGS MLPs with explicit configuration metadata."""
+
+        mkdir_p(path)
+        self._write_sogs_metadata(path)
+        if mode == "split":
+            # COMPATIBILITY: retain the local split TorchScript layout while adding
+            # one file per second-order branch.
+            module_specs = (
+                (
+                    self.mlp_opacity,
+                    "opacity_mlp.pt",
+                    self.render_feat_dim + 3 + self.opacity_dist_dim,
+                ),
+                (
+                    self.mlp_cov,
+                    "cov_mlp.pt",
+                    self.render_feat_dim + 3 + self.cov_dist_dim,
+                ),
+                (
+                    self.mlp_color,
+                    "color_mlp.pt",
+                    self.render_feat_dim + 3 + self.color_dist_dim + self.appearance_dim,
+                ),
+            )
+            for module, filename, input_dim in module_specs:
+                was_training = module.training
+                module.eval()
+                parameter = next(module.parameters(), None)
+                dtype = parameter.dtype if parameter is not None else torch.float32
+                device = parameter.device if parameter is not None else self.device
+                traced = torch.jit.trace(
+                    module,
+                    (torch.rand(1, input_dim, dtype=dtype, device=device),),
+                )
+                traced.save(os.path.join(path, filename))
+                module.train(was_training)
 
             if self.use_feat_bank:
+                was_training = self.mlp_feature_bank.training
                 self.mlp_feature_bank.eval()
-                feature_bank_mlp = torch.jit.trace(self.mlp_feature_bank, (torch.rand(1, 3+1).cuda()))
-                feature_bank_mlp.save(os.path.join(path, 'feature_bank_mlp.pt'))
-                self.mlp_feature_bank.train()
+                parameter = next(self.mlp_feature_bank.parameters())
+                traced = torch.jit.trace(
+                    self.mlp_feature_bank,
+                    (
+                        torch.rand(
+                            1, 4, dtype=parameter.dtype, device=parameter.device
+                        ),
+                    ),
+                )
+                traced.save(os.path.join(path, "feature_bank_mlp.pt"))
+                self.mlp_feature_bank.train(was_training)
 
             if self.appearance_dim:
+                if self.embedding_appearance is None:
+                    raise RuntimeError(
+                        "cannot save appearance MLP before set_appearance()"
+                    )
+                was_training = self.embedding_appearance.training
                 self.embedding_appearance.eval()
-                emd = torch.jit.trace(self.embedding_appearance, (torch.zeros((1,), dtype=torch.long).cuda()))
-                emd.save(os.path.join(path, 'embedding_appearance.pt'))
-                self.embedding_appearance.train()
+                traced = torch.jit.trace(
+                    self.embedding_appearance,
+                    (
+                        torch.zeros(
+                            (1,), dtype=torch.long, device=self.device
+                        ),
+                    ),
+                )
+                traced.save(os.path.join(path, "embedding_appearance.pt"))
+                self.embedding_appearance.train(was_training)
 
-        elif mode == 'unite':
+            if self.second_order_augmentor is not None:
+                for index, branch in enumerate(self.second_order_augmentor.branches):
+                    was_training = branch.training
+                    branch.eval()
+                    parameter = next(branch.parameters())
+                    traced = torch.jit.trace(
+                        branch,
+                        (
+                            torch.rand(
+                                1,
+                                2 * self.feat_dim,
+                                dtype=parameter.dtype,
+                                device=parameter.device,
+                            ),
+                        ),
+                    )
+                    traced.save(
+                        os.path.join(path, f"second_order_mlp_{index}.pt")
+                    )
+                    branch.train(was_training)
+
+        elif mode == "unite":
+            state = {
+                "format_version": 2,
+                "sogs_config": self.get_sogs_config(),
+                "opacity_mlp": self.mlp_opacity.state_dict(),
+                "cov_mlp": self.mlp_cov.state_dict(),
+                "color_mlp": self.mlp_color.state_dict(),
+            }
             if self.use_feat_bank:
-                torch.save({
-                    'opacity_mlp': self.mlp_opacity.state_dict(),
-                    'cov_mlp': self.mlp_cov.state_dict(),
-                    'color_mlp': self.mlp_color.state_dict(),
-                    'feature_bank_mlp': self.mlp_feature_bank.state_dict(),
-                    'appearance': self.embedding_appearance.state_dict()
-                    }, os.path.join(path, 'checkpoints.pth'))
-            elif self.appearance_dim > 0:
-                torch.save({
-                    'opacity_mlp': self.mlp_opacity.state_dict(),
-                    'cov_mlp': self.mlp_cov.state_dict(),
-                    'color_mlp': self.mlp_color.state_dict(),
-                    'appearance': self.embedding_appearance.state_dict()
-                    }, os.path.join(path, 'checkpoints.pth'))
-            else:
-                torch.save({
-                    'opacity_mlp': self.mlp_opacity.state_dict(),
-                    'cov_mlp': self.mlp_cov.state_dict(),
-                    'color_mlp': self.mlp_color.state_dict(),
-                    }, os.path.join(path, 'checkpoints.pth'))
-        else:
-            raise NotImplementedError
-
-
-    def load_mlp_checkpoints(self, path, mode = 'split'):#split or unite
-        if mode == 'split':
-            self.mlp_opacity = torch.jit.load(os.path.join(path, 'opacity_mlp.pt')).cuda()
-            self.mlp_cov = torch.jit.load(os.path.join(path, 'cov_mlp.pt')).cuda()
-            self.mlp_color = torch.jit.load(os.path.join(path, 'color_mlp.pt')).cuda()
-            if self.use_feat_bank:
-                self.mlp_feature_bank = torch.jit.load(os.path.join(path, 'feature_bank_mlp.pt')).cuda()
+                state["feature_bank_mlp"] = self.mlp_feature_bank.state_dict()
             if self.appearance_dim > 0:
-                self.embedding_appearance = torch.jit.load(os.path.join(path, 'embedding_appearance.pt')).cuda()
-        elif mode == 'unite':
-            checkpoint = torch.load(os.path.join(path, 'checkpoints.pth'))
-            self.mlp_opacity.load_state_dict(checkpoint['opacity_mlp'])
-            self.mlp_cov.load_state_dict(checkpoint['cov_mlp'])
-            self.mlp_color.load_state_dict(checkpoint['color_mlp'])
-            if self.use_feat_bank:
-                self.mlp_feature_bank.load_state_dict(checkpoint['feature_bank_mlp'])
-            if self.appearance_dim > 0:
-                self.embedding_appearance.load_state_dict(checkpoint['appearance'])
+                if self.embedding_appearance is None:
+                    raise RuntimeError(
+                        "cannot save appearance MLP before set_appearance()"
+                    )
+                state["appearance"] = self.embedding_appearance.state_dict()
+            if self.second_order_augmentor is not None:
+                state["second_order"] = self.second_order_augmentor.state_dict()
+            torch.save(state, os.path.join(path, "checkpoints.pth"))
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f"unsupported checkpoint mode: {mode}")
+
+    def load_mlp_checkpoints(self, path, mode="split"):
+        """Load MLP state and reject missing/incompatible SOGS components."""
+
+        self._read_sogs_metadata(path)
+        if mode == "split":
+            required = ["opacity_mlp.pt", "cov_mlp.pt", "color_mlp.pt"]
+            if self.use_feat_bank:
+                required.append("feature_bank_mlp.pt")
+            if self.appearance_dim > 0:
+                required.append("embedding_appearance.pt")
+            if self.second_order_augmentor is not None:
+                required.extend(
+                    f"second_order_mlp_{index}.pt"
+                    for index in range(self.num_eigenvectors)
+                )
+            missing = [
+                filename
+                for filename in required
+                if not os.path.isfile(os.path.join(path, filename))
+            ]
+            if missing:
+                raise RuntimeError(
+                    "checkpoint is missing required MLP files: "
+                    + ", ".join(missing)
+                )
+
+            self.mlp_opacity = torch.jit.load(
+                os.path.join(path, "opacity_mlp.pt"), map_location=self.device
+            ).to(self.device)
+            self.mlp_cov = torch.jit.load(
+                os.path.join(path, "cov_mlp.pt"), map_location=self.device
+            ).to(self.device)
+            self.mlp_color = torch.jit.load(
+                os.path.join(path, "color_mlp.pt"), map_location=self.device
+            ).to(self.device)
+            if self.use_feat_bank:
+                self.mlp_feature_bank = torch.jit.load(
+                    os.path.join(path, "feature_bank_mlp.pt"),
+                    map_location=self.device,
+                ).to(self.device)
+            if self.appearance_dim > 0:
+                self.embedding_appearance = torch.jit.load(
+                    os.path.join(path, "embedding_appearance.pt"),
+                    map_location=self.device,
+                ).to(self.device)
+            if self.second_order_augmentor is not None:
+                for index in range(self.num_eigenvectors):
+                    self.second_order_augmentor.branches[index] = torch.jit.load(
+                        os.path.join(path, f"second_order_mlp_{index}.pt"),
+                        map_location=self.device,
+                    ).to(self.device)
+        elif mode == "unite":
+            checkpoint_path = os.path.join(path, "checkpoints.pth")
+            if not os.path.isfile(checkpoint_path):
+                raise RuntimeError(f"missing united checkpoint: {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            if not isinstance(checkpoint, dict):
+                raise RuntimeError(
+                    f"unsupported united checkpoint format in {checkpoint_path}; "
+                    "expected an object"
+                )
+            if checkpoint.get("format_version") != 2 and self.use_second_order:
+                raise RuntimeError(
+                    f"united checkpoint {checkpoint_path} has no SOGS format "
+                    "metadata; cannot load it in SOGS mode"
+                )
+            self._assert_checkpoint_compatible(
+                checkpoint.get("sogs_config"), source=checkpoint_path
+            )
+            required = {"opacity_mlp", "cov_mlp", "color_mlp"}
+            if self.use_feat_bank:
+                required.add("feature_bank_mlp")
+            if self.appearance_dim > 0:
+                required.add("appearance")
+            if self.second_order_augmentor is not None:
+                required.add("second_order")
+            missing = sorted(required.difference(checkpoint.keys()))
+            if missing:
+                raise RuntimeError(
+                    "united checkpoint is missing required state: "
+                    + ", ".join(missing)
+                )
+            self._load_module_state(
+                self.mlp_opacity, checkpoint["opacity_mlp"], "opacity_mlp"
+            )
+            self._load_module_state(self.mlp_cov, checkpoint["cov_mlp"], "cov_mlp")
+            self._load_module_state(
+                self.mlp_color, checkpoint["color_mlp"], "color_mlp"
+            )
+            if self.use_feat_bank:
+                self._load_module_state(
+                    self.mlp_feature_bank,
+                    checkpoint["feature_bank_mlp"],
+                    "feature_bank_mlp",
+                )
+            if self.appearance_dim > 0:
+                self._load_module_state(
+                    self.embedding_appearance,
+                    checkpoint["appearance"],
+                    "appearance_embedding",
+                )
+            if self.second_order_augmentor is not None:
+                self._load_module_state(
+                    self.second_order_augmentor,
+                    checkpoint["second_order"],
+                    "second_order_augmentor",
+                )
+        else:
+            raise NotImplementedError(f"unsupported checkpoint mode: {mode}")

@@ -1,0 +1,11 @@
+# Original Scaffold-GS-compatible path.
+# This repository records configuration through cfg_args; this YAML is a
+# documented command profile rather than an automatic Hydra/OmegaConf input.
+method: scaffold_gs
+use_second_order: false
+feat_dim: 32
+num_eigenvectors: 2
+lambda_sgl: 0.0
+n_offsets: 10
+iterations: 30000
+

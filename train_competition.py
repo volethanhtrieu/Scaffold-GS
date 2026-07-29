@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence
 
+from arguments import str2bool, validate_sogs_config
 from prepare_data import discover_scenes, validate_scene
 
 
@@ -45,6 +46,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--iterations", type=int, default=30_000)
     parser.add_argument("--voxel-size", type=float, default=0.001)
     parser.add_argument("--update-init-factor", type=int, default=16)
+    parser.add_argument("--feat-dim", type=int, default=32)
+    parser.add_argument(
+        "--use-second-order",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Enable SOGS second-order anchor features.",
+    )
+    parser.add_argument("--num-eigenvectors", type=int, default=2)
+    parser.add_argument("--lambda-sgl", type=float, default=0.01)
     parser.add_argument(
         "--appearance-dim",
         type=int,
@@ -103,6 +115,14 @@ def training_command(
         str(args.voxel_size),
         "--update_init_factor",
         str(args.update_init_factor),
+        "--feat_dim",
+        str(args.feat_dim),
+        "--use_second_order",
+        str(args.use_second_order),
+        "--num_eigenvectors",
+        str(args.num_eigenvectors),
+        "--lambda_sgl",
+        str(args.lambda_sgl),
         "--appearance_dim",
         str(args.appearance_dim),
         "--ratio",
@@ -160,6 +180,16 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         return 2
     if args.appearance_dim < 0 or args.ratio <= 0:
         print("--appearance-dim must be non-negative and --ratio positive", file=sys.stderr)
+        return 2
+    try:
+        validate_sogs_config(
+            args.feat_dim,
+            args.use_second_order,
+            args.num_eigenvectors,
+            args.lambda_sgl,
+        )
+    except ValueError as error:
+        print(f"invalid SOGS configuration: {error}", file=sys.stderr)
         return 2
 
     try:

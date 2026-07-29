@@ -20,7 +20,17 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     if visible_mask is None:
         visible_mask = torch.ones(pc.get_anchor.shape[0], dtype=torch.bool, device = pc.get_anchor.device)
     
-    feat = pc._anchor_feat[visible_mask]
+    # COMPATIBILITY: every renderer consumer now shares the model-owned feature
+    # path.  It returns first-order D features for Scaffold-GS and
+    # D*(1+M) second-order features for SOGS.
+    render_features = pc.get_render_features()
+    expected_dim = (
+        pc.feat_dim * (1 + pc.num_eigenvectors)
+        if pc.use_second_order
+        else pc.feat_dim
+    )
+    assert render_features.shape[-1] == expected_dim
+    feat = render_features[visible_mask]
     anchor = pc.get_anchor[visible_mask]
     grid_offsets = pc._offset[visible_mask]
     grid_scaling = pc.get_scaling[visible_mask]
@@ -30,7 +40,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     # dist
     ob_dist = ob_view.norm(dim=1, keepdim=True)
     # view
-    ob_view = ob_view / ob_dist
+    ob_view = ob_view / ob_dist.clamp_min(torch.finfo(ob_view.dtype).eps)
 
     ## view-adaptive feature
     if pc.use_feat_bank:
@@ -40,14 +50,30 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
         ## multi-resolution feat
         feat = feat.unsqueeze(dim=-1)
-        feat = feat[:,::4, :1].repeat([1,4,1])*bank_weight[:,:,:1] + \
-            feat[:,::2, :1].repeat([1,2,1])*bank_weight[:,:,1:2] + \
-            feat[:,::1, :1]*bank_weight[:,:,2:]
+        feature_width = feat.shape[1]
+        coarse_four = feat[:, ::4, :1]
+        coarse_two = feat[:, ::2, :1]
+        # COMPATIBILITY: preserve the original periodic feature-bank repeat for
+        # widths divisible by four, and trim the repeated views for any valid
+        # SOGS feature width that is not divisible by two/four.
+        coarse_four = coarse_four.repeat(
+            [1, math.ceil(feature_width / coarse_four.shape[1]), 1]
+        )[:, :feature_width]
+        coarse_two = coarse_two.repeat(
+            [1, math.ceil(feature_width / coarse_two.shape[1]), 1]
+        )[:, :feature_width]
+        feat = (
+            coarse_four * bank_weight[:, :, :1]
+            + coarse_two * bank_weight[:, :, 1:2]
+            + feat[:, ::1, :1] * bank_weight[:, :, 2:]
+        )
         feat = feat.squeeze(dim=-1) # [n, c]
 
 
     cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1) # [N, c+3+1]
     cat_local_view_wodist = torch.cat([feat, ob_view], dim=1) # [N, c+3]
+    assert cat_local_view.shape[1] == expected_dim + 4
+    assert cat_local_view_wodist.shape[1] == expected_dim + 3
     if pc.appearance_dim > 0:
         camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * viewpoint_camera.uid
         # camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * 10
@@ -125,7 +151,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     
 
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = torch.zeros_like(xyz, dtype=pc.get_anchor.dtype, requires_grad=True, device="cuda") + 0
+    screenspace_points = torch.zeros_like(
+        xyz,
+        dtype=pc.get_anchor.dtype,
+        requires_grad=True,
+        device=xyz.device,
+    ) + 0
     if retain_grad:
         try:
             screenspace_points.retain_grad()
@@ -190,7 +221,12 @@ def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch
     Background tensor (bg_color) must be on GPU!
     """
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = torch.zeros_like(pc.get_anchor, dtype=pc.get_anchor.dtype, requires_grad=True, device="cuda") + 0
+    screenspace_points = torch.zeros_like(
+        pc.get_anchor,
+        dtype=pc.get_anchor.dtype,
+        requires_grad=True,
+        device=pc.get_anchor.device,
+    ) + 0
     try:
         screenspace_points.retain_grad()
     except:

@@ -64,7 +64,6 @@ import numpy as np
 import torch
 import torchvision
 import json
-import wandb
 import time
 from os import makedirs
 import shutil, pathlib
@@ -72,9 +71,16 @@ from pathlib import Path
 from PIL import Image
 import torchvision.transforms.functional as tf
 # from lpipsPyTorch import lpips
-import lpips
+try:
+    import wandb
+except ImportError:
+    wandb = None
+try:
+    import lpips
+except ImportError:
+    lpips = None
 from random import randint
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import l1_loss, selective_gradient_loss, ssim
 from gaussian_renderer import prefilter_voxel, render, network_gui
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -85,7 +91,9 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 
 # torch.set_num_threads(32)
-lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
+# COMPATIBILITY: avoid constructing a GPU LPIPS model during --help/import.
+# Evaluation initializes it lazily on the rendered image's device.
+lpips_fn = None
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -122,8 +130,23 @@ def saveRuntimeCode(dst: str) -> None:
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
+    gaussians = GaussianModel(
+        feat_dim=dataset.feat_dim,
+        n_offsets=dataset.n_offsets,
+        voxel_size=dataset.voxel_size,
+        update_depth=dataset.update_depth,
+        update_init_factor=dataset.update_init_factor,
+        update_hierachy_factor=dataset.update_hierachy_factor,
+        use_feat_bank=dataset.use_feat_bank,
+        appearance_dim=dataset.appearance_dim,
+        ratio=dataset.ratio,
+        add_opacity_dist=dataset.add_opacity_dist,
+        add_cov_dist=dataset.add_cov_dist,
+        add_color_dist=dataset.add_color_dist,
+        use_second_order=dataset.use_second_order,
+        num_eigenvectors=dataset.num_eigenvectors,
+        lambda_sgl=dataset.lambda_sgl,
+    )
     scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
     gaussians.training_setup(opt)
     if checkpoint:
@@ -182,7 +205,17 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         ssim_loss = (1.0 - ssim(image, gt_image))
         scaling_reg = scaling.prod(dim=1).mean()
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
+        # COMPATIBILITY: retain the original Scaffold-GS objective exactly
+        # when SOGS is disabled or lambda_sgl is zero.
+        sgl_loss = image.new_zeros(())
+        if dataset.use_second_order and dataset.lambda_sgl > 0:
+            sgl_loss = selective_gradient_loss(image, gt_image)
+        loss = (
+            (1.0 - opt.lambda_dssim) * Ll1
+            + opt.lambda_dssim * ssim_loss
+            + 0.01 * scaling_reg
+            + dataset.lambda_sgl * sgl_loss
+        )
 
         loss.backward()
         
@@ -193,13 +226,38 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                progress_bar.set_postfix(
+                    {
+                        "L1": f"{Ll1.item():.5f}",
+                        "SSIM": f"{ssim_loss.item():.5f}",
+                        "Vol": f"{scaling_reg.item():.5f}",
+                        "SGL": f"{sgl_loss.item():.5f}",
+                        "Total": f"{ema_loss_for_log:.7f}",
+                    }
+                )
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger)
+            training_report(
+                tb_writer,
+                dataset_name,
+                iteration,
+                Ll1,
+                loss,
+                l1_loss,
+                iter_start.elapsed_time(iter_end),
+                testing_iterations,
+                scene,
+                render,
+                (pipe, background),
+                wandb,
+                logger,
+                ssim_loss=ssim_loss,
+                scaling_reg=scaling_reg,
+                sgl_loss=sgl_loss,
+            )
             if (iteration in saving_iterations):
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -248,15 +306,64 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, wandb=None, logger=None):
+def training_report(
+    tb_writer,
+    dataset_name,
+    iteration,
+    Ll1,
+    loss,
+    l1_loss,
+    elapsed,
+    testing_iterations,
+    scene : Scene,
+    renderFunc,
+    renderArgs,
+    wandb=None,
+    logger=None,
+    *,
+    ssim_loss=None,
+    scaling_reg=None,
+    sgl_loss=None,
+):
+    # COMPATIBILITY: retain the local Scaffold-GS positional interface while
+    # accepting optional component tensors for SOGS logging.
+    if ssim_loss is None:
+        ssim_loss = loss.new_zeros(())
+    if scaling_reg is None:
+        scaling_reg = loss.new_zeros(())
+    if sgl_loss is None:
+        sgl_loss = loss.new_zeros(())
     if tb_writer:
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/l1_loss', Ll1.item(), iteration)
+        tb_writer.add_scalar(
+            f'{dataset_name}/train_loss_patches/ssim_loss',
+            ssim_loss.item(),
+            iteration,
+        )
+        tb_writer.add_scalar(
+            f'{dataset_name}/train_loss_patches/volume_regularization',
+            scaling_reg.item(),
+            iteration,
+        )
+        tb_writer.add_scalar(
+            f'{dataset_name}/train_loss_patches/selective_gradient_loss',
+            sgl_loss.item(),
+            iteration,
+        )
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar(f'{dataset_name}/iter_time', elapsed, iteration)
 
 
     if wandb is not None:
-        wandb.log({"train_l1_loss":Ll1, 'train_total_loss':loss, })
+        wandb.log(
+            {
+                "train_l1_loss": Ll1,
+                "train_ssim_loss": ssim_loss,
+                "train_volume_regularization": scaling_reg,
+                "train_selective_gradient_loss": sgl_loss,
+                "train_total_loss": loss,
+            }
+        )
     
     # Report test and samples of training set
     if iteration in testing_iterations:
@@ -363,8 +470,23 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train=True, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None):
     with torch.no_grad():
-        gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
+        gaussians = GaussianModel(
+            feat_dim=dataset.feat_dim,
+            n_offsets=dataset.n_offsets,
+            voxel_size=dataset.voxel_size,
+            update_depth=dataset.update_depth,
+            update_init_factor=dataset.update_init_factor,
+            update_hierachy_factor=dataset.update_hierachy_factor,
+            use_feat_bank=dataset.use_feat_bank,
+            appearance_dim=dataset.appearance_dim,
+            ratio=dataset.ratio,
+            add_opacity_dist=dataset.add_opacity_dist,
+            add_cov_dist=dataset.add_cov_dist,
+            add_color_dist=dataset.add_color_dist,
+            use_second_order=dataset.use_second_order,
+            num_eigenvectors=dataset.num_eigenvectors,
+            lambda_sgl=dataset.lambda_sgl,
+        )
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         gaussians.eval()
 
@@ -406,6 +528,7 @@ def readImages(renders_dir, gt_dir):
 
 
 def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, dataset_name=None, logger=None):
+    global lpips_fn
 
     full_dict = {}
     per_view_dict = {}
@@ -432,6 +555,13 @@ def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, datase
         gt_dir = method_dir/ "gt"
         renders_dir = method_dir / "renders"
         renders, gts, image_names = readImages(renders_dir, gt_dir)
+
+        if lpips_fn is None:
+            if lpips is None:
+                raise RuntimeError(
+                    "LPIPS is required for evaluation; install the lpips package"
+                )
+            lpips_fn = lpips.LPIPS(net='vgg').to(renders[0].device)
 
         ssims = []
         psnrs = []
@@ -547,6 +677,10 @@ if __name__ == "__main__":
     exp_name = args.model_path.split('/')[-2]
     
     if args.use_wandb:
+        if wandb is None:
+            raise RuntimeError(
+                "--use_wandb was requested but the wandb package is not installed"
+            )
         wandb.login()
         run = wandb.init(
             # Set the project where this run will be logged

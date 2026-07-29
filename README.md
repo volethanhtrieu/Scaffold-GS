@@ -111,6 +111,47 @@ For custom data, you should process the image sequences with [Colmap](https://co
 
 ## Training
 
+### Optional SOGS mode
+
+The implementation follows [SOGS: Second-Order Anchor for Advanced 3D Gaussian
+Splatting](https://arxiv.org/abs/2503.07476) while retaining this repository's
+Scaffold-GS interfaces.
+
+This fork preserves the original Scaffold-GS path and adds the SOGS
+second-order anchor method behind an explicit feature flag:
+
+```bash
+# Original Scaffold-GS behavior
+python train.py -s <scene> -m <output> \
+    --use_second_order False --feat_dim 32 --lambda_sgl 0
+
+# SOGS paper reference settings (not competition-tuned)
+python train.py -s <scene> -m <output> \
+    --use_second_order True --feat_dim 16 \
+    --num_eigenvectors 2 --lambda_sgl 0.01
+```
+
+`use_second_order` accepts explicit `True` and `False` values safely.
+`feat_dim` must be positive, `num_eigenvectors` must be between 1 and
+`feat_dim` when SOGS is enabled, and `lambda_sgl` must be non-negative.
+The saved `cfg_args` and per-iteration `sogs_config.json` record these settings;
+rendering rejects architecture-incompatible checkpoints rather than silently
+initializing missing modules.
+
+Reference profiles are documented in `configs/`, and opt-in launchers are in
+`scripts/`. The YAML files document command profiles; the repository continues
+to use command-line arguments and `cfg_args` rather than loading YAML directly.
+SOGS defaults come from the paper and are not claimed to be optimal for the
+Viettel AI Race scenes.
+
+For a complete command-by-command walkthrough, see
+[`docs/sogs_run_guide.md`](docs/sogs_run_guide.md).
+
+Before training on another machine, follow
+[`docs/push_sogs_branch.md`](docs/push_sogs_branch.md) to push a dedicated
+branch, clone it, transfer the ignored dataset separately, and run the
+non-training environment verifier.
+
 ### Training multiple scenes
 
 To train multiple scenes in parallel, we provide batch training scripts: 
@@ -205,6 +246,9 @@ Recommended checkpoint  structure in the model path location:
 |   |---color_mlp.pt
 |   |---cov_mlp.pt
 |   |---opacity_mlp.pt
+|   |---second_order_mlp_0.pt (SOGS only)
+|   |---second_order_mlp_1.pt (SOGS only; one per selected eigenvector)
+|   |---sogs_config.json
 (|   |---embedding_appearance.pt)
 |---cfg_args
 |---cameras.json

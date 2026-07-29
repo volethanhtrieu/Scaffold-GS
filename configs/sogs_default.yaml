@@ -1,0 +1,9 @@
+# SOGS paper reference profile, not a guaranteed competition-optimal setting.
+method: sogs
+use_second_order: true
+feat_dim: 16
+num_eigenvectors: 2
+lambda_sgl: 0.01
+n_offsets: 10
+iterations: 30000
+
