@@ -1,0 +1,191 @@
+Đã code xong profile ultra cho A100 80GB và giữ nguyên profile throughput cũ.
+
+  Các thay đổi chính nằm tại:
+
+  - scripts/train_sogs_a100.sh:76
+  - scripts/run_sogs_a100_max_speed.sh:16
+  - configs/sogs_a100_ultra.yaml:1
+  - docs/sogs_run_guide.md:385
+
+  Profile ultra sử dụng:
+
+  - Training resolution: 1/4 width và height, khoảng 1/16 số pixel
+  - feat_dim=8, num_eigenvectors=1
+  - n_offsets=5
+  - Tắt SGL: lambda_sgl=0
+  - Lấy mỗi điểm thứ hai: ratio=2
+  - Dừng densification tại iteration 7500
+  - TF32, optimizer tự chọn fused/foreach
+  - Chunk lớn dành cho A100 80GB
+  - Vẫn chạy đủ 30,000 iterations
+
+  Đây là profile hướng đến tốc độ, có thể làm giảm chất lượng chi tiết. Không thể bảo đảm 10–20 it/s trước khi benchmark thật.
+
+  ## Chạy trên RunPod
+
+  ### 1. Đồng bộ code mới lên Pod
+
+  Các thay đổi hiện chưa tự động xuất hiện trên RunPod. Sau khi push branch từ máy local, trên Pod chạy:
+
+  cd /workspace/Scaffold-GS-SOGS
+
+  git status --short
+  git pull --ff-only origin feature/sogs-integration
+
+  chmod +x scripts/train_sogs_a100.sh
+  chmod +x scripts/run_sogs_a100_max_speed.sh
+  chmod +x scripts/verify_sogs_environment.sh
+
+  Không dùng git pull nếu Pod đang có code chưa commit mà bạn muốn giữ.
+
+  ### 2. Kích hoạt Conda environment
+
+  source /opt/conda/etc/profile.d/conda.sh
+  conda activate /workspace/conda-envs/scaffold-sogs-cu118
+
+  cd /workspace/Scaffold-GS-SOGS
+
+  which python
+  python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))"
+
+  ### 3. Kiểm tra environment và data
+
+  scripts/verify_sogs_environment.sh \
+    --gpu 0 \
+    --data-root ./data
+
+  Không bắt đầu training nếu phần required imports, CUDA smoke tests hoặc seven-scene data audit vẫn báo [FAIL].
+
+  ### 4. Đảm bảo GPU trống
+
+  nvidia-smi
+
+  Launcher sẽ tự từ chối chạy nếu GPU đang có compute process. Nó không tự kill process của người khác.
+
+  ### 5. Dry-run cả 7 scene
+
+  scripts/run_sogs_a100_max_speed.sh \
+    --profile ultra \
+    --gpu 0 \
+    --data-root ./data \
+    --output-root outputs/a100_ultra_all \
+    --log-root logs/a100_ultra_all \
+    --dry-run
+
+  Nó phải in đúng 7 scene:
+
+  HCM0421 HCM0539 HCM0540 HCM0644 HCM0674 bonsai chair
+
+  Dry-run không chạy training và không tạo output.
+
+  ### 6. Chạy training cả 7 scene
+
+  Khuyến nghị dùng tmux:
+
+  tmux new -s sogs-ultra
+
+  Sau đó:
+
+  cd /workspace/Scaffold-GS-SOGS
+  conda activate /workspace/conda-envs/scaffold-sogs-cu118
+
+  scripts/run_sogs_a100_max_speed.sh \
+    --profile ultra \
+    --gpu 0 \
+    --data-root ./data \
+    --output-root outputs/a100_ultra_all \
+    --log-root logs/a100_ultra_all
+
+  Không truyền tên scene thì script tự chạy tuần tự cả 7 scene. Với một GPU, không nên chạy 7 scene song song.
+
+  Detach khỏi tmux bằng Ctrl+B, sau đó D. Quay lại:
+
+  tmux attach -t sogs-ultra
+
+  Theo dõi GPU ở terminal khác:
+
+  nvidia-smi dmon -s pucm -d 1
+
+  ## Ước tính thời gian
+
+  Với 30,000 iterations mỗi scene:
+
+      Tốc độ       Một scene          Bảy scene
+  ━━━━━━━━━━━  ━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━
+   1.66 it/s    khoảng 5 giờ    khoảng 35.1 giờ
+  ───────────  ──────────────  ─────────────────
+     10 it/s         50 phút      5 giờ 50 phút
+  ───────────  ──────────────  ─────────────────
+     20 it/s         25 phút      2 giờ 55 phút
+
+  Chưa tính thời gian load data và lưu checkpoint. Tốc độ cũng có thể thay đổi khi số anchor tăng.
+
+  ## Render kết quả sau training
+
+  python render_test_poses.py \
+    --data-root ./data \
+    --model-root outputs/a100_ultra_all \
+    --predictions-root predictions/a100_ultra_all \
+    --scenes HCM0421 HCM0539 HCM0540 HCM0644 HCM0674 bonsai chair \
+    --iteration -1 \
+    --gpu 0
+
+  Tạo submission:
+
+  python generate_submission.py \
+    --data-root ./data \
+    --predictions-root predictions/a100_ultra_all \
+    --output submission_a100_ultra.zip \
+    --scenes HCM0421 HCM0539 HCM0540 HCM0644 HCM0674 bonsai chair \
+    --filename-mode png
+
+  python -m zipfile -t submission_a100_ultra.zip
+
+  cd /workspace/Scaffold-GS-SOGS
+  conda activate /workspace/conda-envs/scaffold-sogs-cu118
+
+  for QUALITY in 100 99 98; do
+      python generate_submission.py \
+          --data-root ./data \
+          --predictions-root predictions/a100_ultra_all \
+          --output "submission_a100_ultra_jpeg_q${QUALITY}.zip" \
+          --scenes "${SCENES[@]}" \
+          --filename-mode image-name \
+          --transcode-jpeg \
+          --jpeg-quality "${QUALITY}" \
+          --jpeg-subsampling 444
+
+      python -m zipfile -t \
+          "submission_a100_ultra_jpeg_q${QUALITY}.zip"
+  done
+
+  ls -lh submission_a100_ultra_jpeg_q*.zip
+
+  Kết quả:
+
+
+
+
+  set -euo pipefail
+
+  REMOTE="root@204.12.201.58"
+  REMOTE_DIR="/workspace/Scaffold-GS-SOGS"
+  SSH_KEY="$HOME/.ssh/runpod_linux_ed25519"
+  DESTINATION="$HOME/Desktop"
+  PORT="50968"
+
+  mkdir -p "$DESTINATION"
+
+  for QUALITY in 100 99 98; do
+      FILE="submission_a100_ultra_jpeg_q${QUALITY}.zip"
+
+      echo "Downloading ${FILE}..."
+      scp \
+          -P "$PORT" \
+          -i "$SSH_KEY" \
+          "${REMOTE}:${REMOTE_DIR}/${FILE}" \
+          "${DESTINATION}/"
+  done
+
+  echo "Download completed:"
+  ls -lh "$DESTINATION"/submission_a100_ultra_jpeg_q*.zip
