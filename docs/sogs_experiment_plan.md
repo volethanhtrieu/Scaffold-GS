@@ -117,6 +117,9 @@ DRY_RUN=1 scripts/train_sogs_a100.sh throughput \
 
 DRY_RUN=1 scripts/train_sogs_a100.sh quality \
   "$SCENE_PATH" "$RUN_ROOT/F_a100_quality"
+
+DRY_RUN=1 scripts/train_sogs_a100.sh ultra \
+  "$SCENE_PATH" "$RUN_ROOT/G_a100_ultra"
 ```
 
 Remove `DRY_RUN=1` only for an authorized run. Candidate E uses `D=16`, TF32,
@@ -124,6 +127,14 @@ automatic fused/foreach Adam, retained activations, and reduced finite/logging
 synchronization. Candidate F uses `D=32`, IEEE FP32, the original Adam backend,
 retained activations, and finite checks. Both retain full resolution, `M=2`,
 ten offsets, SGL weight 0.01, and 30,000 iterations.
+
+Candidate G is an aggressive speed-only workload: quarter-width and
+quarter-height training images, `D=8`, `M=1`, five offsets, input-point
+`ratio=2`, no SGL, and anchor growth ending at iteration 7,500. Because several
+variables change at once, G is not part of the controlled A--D comparison and
+cannot identify which change caused a quality or speed difference. Use it only
+to test a hard runtime target, recording the same metrics and retaining its
+separate output/configuration.
 
 For a fair runtime ablation of E, compare these one at a time while keeping
 `D=16` fixed:

@@ -375,6 +375,7 @@ Reference profiles are documented in:
 - [`configs/sogs_compact.yaml`](../configs/sogs_compact.yaml)
 - [`configs/sogs_one_hour.yaml`](../configs/sogs_one_hour.yaml)
 - [`configs/sogs_a100_throughput.yaml`](../configs/sogs_a100_throughput.yaml)
+- [`configs/sogs_a100_ultra.yaml`](../configs/sogs_a100_ultra.yaml)
 - [`configs/sogs_a100_quality.yaml`](../configs/sogs_a100_quality.yaml)
 
 The YAML files document profiles; `train_competition.py` receives the settings
@@ -389,23 +390,24 @@ driver; the PyTorch CUDA runtime and the toolkit used to compile the two local
 extensions must still match each other. Do not rebuild the extensions merely
 because the driver reports a newer version.
 
-The shortest full-speed path trains all seven scenes sequentially with the
-throughput profile:
+The seven-scene runner defaults to the existing full-resolution `throughput`
+profile. Select `ultra` explicitly for the workload-reduced speed ablation:
 
 ```bash
-# Preview all commands without touching the GPU or outputs.
+# Preview the unchanged default without touching the GPU or outputs.
 scripts/run_sogs_a100_max_speed.sh --dry-run
 
-# Starts training after verification and the idle-GPU check pass.
-scripts/run_sogs_a100_max_speed.sh
+# Preview the aggressive profile without touching the GPU or outputs.
+scripts/run_sogs_a100_max_speed.sh --profile ultra --dry-run
+
+# Train all seven scenes after verification and the idle-GPU check pass.
+scripts/run_sogs_a100_max_speed.sh --profile ultra
 ```
 
-The launcher keeps full image resolution, SOGS `D=16`, `M=2`, ten offsets,
-SGL weight `0.01`, and 30,000 iterations. It enables TF32 and the fastest Adam
-backend supported by the active PyTorch, avoids activation recomputation and
-training-time evaluation, and reduces synchronized progress logging. It
-refuses a busy GPU or non-empty per-scene output directory; it does not kill
-processes or delete results.
+The launcher refuses a busy GPU or non-empty per-scene output directory; it
+does not kill processes or delete results. Profile-specific default roots keep
+ultra models and logs under `outputs/a100_ultra_speed/` and
+`logs/a100_ultra_speed/`.
 
 First verify that no unrelated process is consuming the GPU. The supplied
 snapshot showed PID 8129 at 87% utilization, so a second training process would
@@ -416,40 +418,93 @@ DRY_RUN=1 scripts/train_sogs_a100.sh throughput \
   data/HCM0421/train \
   outputs/a100_throughput/HCM0421
 
+DRY_RUN=1 scripts/train_sogs_a100.sh ultra \
+  data/HCM0421/train \
+  outputs/a100_ultra_speed/HCM0421
+
 DRY_RUN=1 scripts/train_sogs_a100.sh quality \
   data/HCM0421/train \
   outputs/a100_quality/HCM0421
 ```
 
 The launcher requires a new or empty output path. Remove `DRY_RUN=1` only when
-training is intentionally authorized.
+training is intentional.
 
-| Setting | Throughput candidate | Quality-control candidate |
-|---|---:|---:|
-| Base feature `D` | 16 | 32 |
-| Selected directions `M` | 2 | 2 |
-| Render width `D*(1+M)` | 48 | 96 |
-| SGL weight | 0.01 | 0.01 |
-| Offsets | 10 | 10 |
-| Appearance embedding | Disabled (`A=0`) | Disabled (`A=0`) |
-| Activation checkpointing | Off | Off |
-| Full finite reductions | Off | On |
-| Eval feature cache | On | On |
-| TF32 | Enabled | Disabled |
-| Adam backend | Auto (fused/foreach when exposed) | Original default |
-| Iterations/resolution | 30,000/full | 30,000/full |
+| Setting | Throughput | Ultra speed | Quality control |
+|---|---:|---:|---:|
+| Base feature `D` | 16 | 8 | 32 |
+| Selected directions `M` | 2 | 1 | 2 |
+| Render width `D*(1+M)` | 48 | 16 | 96 |
+| SGL weight | 0.01 | 0 | 0.01 |
+| Offsets | 10 | 5 | 10 |
+| Training pixel scale | Full | 1/4 width and height | Full |
+| Initial point ratio | 1 | 2 (take every second point) | 1 |
+| Anchor growth ends | 15,000 | 7,500 | 15,000 |
+| SOGS/densification chunks | 65,536 / 8,192 | 262,144 / 16,384 | 65,536 / 8,192 |
+| Appearance embedding | Disabled (`A=0`) | Disabled (`A=0`) | Disabled (`A=0`) |
+| Activation checkpointing | Off | Off | Off |
+| Full finite reductions | Off | Off | On |
+| Eval feature cache | On | On | On |
+| TF32 | Enabled | Enabled | Disabled |
+| Adam backend | Auto | Auto | Original default |
+| Log interval | 250 in seven-scene runner | 1,000 | 250 |
+| Iterations | 30,000 | 30,000 | 30,000 |
 
 Disabling checkpointing is the principal 80-GiB optimization: it avoids
 recomputing every SOGS and attribute-MLP activation during backward. The
 throughput candidate also avoids full-tensor finite checks, writes synchronized
-logs every 50 iterations, enables cuDNN autotuning, and opts into TF32. Those
-changes should improve throughput but can change floating-point rounding; they
-must be compared against the FP32 control using the competition metrics.
+logs every 50 iterations when launched directly (250 in the seven-scene
+runner), enables cuDNN autotuning, and opts into TF32. Those changes should
+improve throughput but can change floating-point rounding; they must be
+compared against the FP32 control using the competition metrics.
 
 `sogs_cache_render_features=True` is active only in eval mode under
 `torch.no_grad()`. It materializes the frozen `N x D*(1+M)` tensor once and
 reuses it for the 40--70 target cameras. Returning to training invalidates the
 cache.
+
+Ultra is the only prepared profile intended to move a 1.66 iteration/s job
+toward the requested 10--20 iteration/s range. Its `resolution=4` setting
+processes approximately 1/16 as many training pixels, while the other capacity
+reductions lower anchor/MLP work. This is a plausible target, not a guarantee:
+scene visibility and anchor growth still change iteration cost. At exactly
+1.66 iteration/s, 30,000 iterations take about 5.02 hours per scene and 35.1
+hours for seven scenes; 10 and 20 iteration/s would take about 5.83 and 2.92
+hours total, respectively, before dataset loading and checkpoint-saving
+overhead.
+
+Ultra is not mathematically or quality equivalent to the full-resolution
+profiles. It may reduce fine detail, PSNR, SSIM, and the competition score.
+`render_test_poses.py` still uses every CSV camera's requested output width and
+height, so submission image dimensions remain correct; lower-resolution
+training can nevertheless produce softer full-size renders. Benchmark one
+scene before committing to all seven:
+
+```bash
+# Actual training: one scene only.
+scripts/run_sogs_a100_max_speed.sh \
+  --profile ultra \
+  --output-root outputs/a100_ultra_probe \
+  --log-root logs/a100_ultra_probe \
+  HCM0421
+```
+
+Read the measured iteration rate from the progress display/log and inspect
+GPU utilization in another terminal:
+
+```bash
+nvidia-smi dmon -s pucm -d 1
+```
+
+If the probe is fast enough and its validation renders are acceptable, use a
+fresh output root for all seven scenes:
+
+```bash
+scripts/run_sogs_a100_max_speed.sh \
+  --profile ultra \
+  --output-root outputs/a100_ultra_all \
+  --log-root logs/a100_ultra_all
+```
 
 ## 9B. From-scratch one-hour fallback
 

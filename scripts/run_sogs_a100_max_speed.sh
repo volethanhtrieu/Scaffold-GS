@@ -6,15 +6,16 @@ usage() {
 Usage:
   scripts/run_sogs_a100_max_speed.sh [options] [scene ...]
 
-Train the seven competition scenes sequentially with the A100 throughput
-profile. When no scene names are supplied, the defaults are:
+Train the seven competition scenes sequentially with a selected A100 profile.
+When no scene names are supplied, the defaults are:
 
   HCM0421 HCM0539 HCM0540 HCM0644 HCM0674 bonsai chair
 
 Options:
   --data-root PATH       Scene root (default: data)
-  --output-root PATH     Model root (default: outputs/a100_max_speed)
-  --log-root PATH        Console-log root (default: logs/a100_max_speed)
+  --profile PROFILE      throughput, ultra, or quality (default: throughput)
+  --output-root PATH     Model root (default: profile-specific outputs/a100_*)
+  --log-root PATH        Console-log root (default: profile-specific logs/a100_*)
   --gpu ID               Physical GPU index (default: 0)
   --idle-timeout SEC     Wait for transient GPU activity (default: 60)
   --skip-verify          Skip the non-training environment/data verifier
@@ -27,6 +28,9 @@ Examples:
 
   # Start all seven scenes, one after another:
   scripts/run_sogs_a100_max_speed.sh
+
+  # Aggressive speed/quality tradeoff; preview before running:
+  scripts/run_sogs_a100_max_speed.sh --profile ultra --dry-run
 
   # Train only two scenes:
   scripts/run_sogs_a100_max_speed.sh bonsai chair
@@ -113,8 +117,9 @@ per_scene_launcher="${script_dir}/train_sogs_a100.sh"
 environment_verifier="${script_dir}/verify_sogs_environment.sh"
 
 data_root="data"
-output_root="outputs/a100_max_speed"
-log_root="logs/a100_max_speed"
+output_root=""
+log_root=""
+profile="throughput"
 physical_gpu=0
 idle_timeout_seconds=60
 skip_verify=0
@@ -135,6 +140,11 @@ while (($# > 0)); do
         --data-root)
             (($# >= 2)) || fail "--data-root requires a path"
             data_root=$2
+            shift 2
+            ;;
+        --profile)
+            (($# >= 2)) || fail "--profile requires a value"
+            profile=$2
             shift 2
             ;;
         --output-root)
@@ -186,6 +196,41 @@ while (($# > 0)); do
     esac
 done
 
+case "${profile}" in
+    throughput)
+        profile_summary="A100 throughput (full resolution, D=16, M=2, SGL=0.01, 10 offsets, densification to 15,000)"
+        profile_default_output="outputs/a100_max_speed"
+        profile_default_logs="logs/a100_max_speed"
+        profile_log_interval=250
+        profile_finite_scans="disabled"
+        profile_tf32="enabled"
+        profile_adam="automatic fused/foreach fallback"
+        ;;
+    ultra)
+        # INFERENCE: this explicit profile changes the workload to target much
+        # higher iteration throughput; it is not a quality-equivalent profile.
+        profile_summary="A100 ultra speed (quarter width/height, D=8, M=1, SGL=0, 5 offsets, densification to 7,500)"
+        profile_default_output="outputs/a100_ultra_speed"
+        profile_default_logs="logs/a100_ultra_speed"
+        profile_log_interval=1000
+        profile_finite_scans="disabled"
+        profile_tf32="enabled"
+        profile_adam="automatic fused/foreach fallback"
+        ;;
+    quality)
+        profile_summary="A100 quality control (full resolution, D=32, M=2, SGL=0.01, 10 offsets, densification to 15,000)"
+        profile_default_output="outputs/a100_quality"
+        profile_default_logs="logs/a100_quality"
+        profile_log_interval=250
+        profile_finite_scans="enabled"
+        profile_tf32="disabled"
+        profile_adam="original default"
+        ;;
+    *)
+        fail "unknown profile: ${profile}; expected throughput, ultra, or quality"
+        ;;
+esac
+
 [[ "${physical_gpu}" =~ ^[0-9]+$ ]] \
     || fail "--gpu must be a non-negative integer"
 [[ "${idle_timeout_seconds}" =~ ^[0-9]+$ ]] \
@@ -197,6 +242,8 @@ if ((${#scenes[@]} == 0)); then
     scenes=("${default_scenes[@]}")
 fi
 
+output_root=${output_root:-${profile_default_output}}
+log_root=${log_root:-${profile_default_logs}}
 data_root=$(make_absolute "${data_root}")
 output_root=$(make_absolute "${output_root}")
 log_root=$(make_absolute "${log_root}")
@@ -225,14 +272,14 @@ printf 'Output root: %s\n' "${output_root}"
 printf 'Scenes:'
 printf ' %s' "${scenes[@]}"
 printf '\n'
-printf 'Profile: A100 throughput (full resolution, D=16, M=2, SGL=0.01, 30,000 iterations)\n'
+printf 'Profile: %s; 30,000 iterations\n' "${profile_summary}"
 
 if ((dry_run)); then
     printf 'Dry run: GPU checks, verification, output creation, and training are disabled.\n'
     for scene in "${scenes[@]}"; do
-        DRY_RUN=1 GPU_ID=-1 LOG_INTERVAL=250 \
+        DRY_RUN=1 GPU_ID=-1 LOG_INTERVAL="${profile_log_interval}" \
             bash "${per_scene_launcher}" \
-            throughput \
+            "${profile}" \
             "${data_root}/${scene}/train" \
             "${output_root}/${scene}"
     done
@@ -292,12 +339,13 @@ printf '  CUDA_VISIBLE_DEVICES=%s\n' "${CUDA_VISIBLE_DEVICES}"
 printf '  TORCH_CUDA_ARCH_LIST=%s\n' "${TORCH_CUDA_ARCH_LIST}"
 printf '  CUDA debug synchronization: disabled\n'
 printf '  PyTorch CUDA allocator cache: enabled\n'
-printf '  Per-iteration finite scans: disabled\n'
-printf '  TF32: enabled\n'
-printf '  Adam backend: automatic fused/foreach fallback\n'
+printf '  Per-iteration finite scans: %s\n' "${profile_finite_scans}"
+printf '  TF32: %s\n' "${profile_tf32}"
+printf '  Adam backend: %s\n' "${profile_adam}"
 printf '  Activation checkpoint recomputation: disabled\n'
 printf '  Training-time evaluation/post-processing: disabled\n'
-printf '  Scalar/progress synchronization: every 250 iterations\n'
+printf '  Scalar/progress synchronization: every %s iterations\n' \
+    "${profile_log_interval}"
 printf '  Logs: %s\n\n' "${run_log_root}"
 
 run_started_epoch=$(date +%s)
@@ -307,12 +355,12 @@ for scene in "${scenes[@]}"; do
     scene_log="${run_log_root}/${scene}.log"
     scene_started_epoch=$(date +%s)
 
-    printf '\n[%s] Starting max-speed training.\n' "${scene}" \
+    printf '\n[%s] Starting %s training.\n' "${scene}" "${profile}" \
         | tee -a "${scene_log}"
     set +e
-    GPU_ID=-1 LOG_INTERVAL=250 \
+    GPU_ID=-1 LOG_INTERVAL="${profile_log_interval}" \
         bash "${per_scene_launcher}" \
-        throughput \
+        "${profile}" \
         "${scene_path}" \
         "${model_path}" \
         2>&1 | tee -a "${scene_log}"

@@ -54,7 +54,7 @@ not exposed in the present workspace.
 | Runtime math controls | FP32/legacy optimizer behavior remains the default | Opt in to TF32, cuDNN autotuning, and fused Adam when supported | `arguments/__init__.py`, `train.py`, `scene/gaussian_model.py` | Medium | Parser/runtime smoke tests; score A/B test required |
 | Loss-kernel caching/fusion | Preserve the same Sobel and SSIM equations | Cache fixed kernels and evaluate prediction/target x/y Sobel maps in one grouped convolution | `utils/loss_utils.py` | Low | Synthetic image equality test |
 | Reduced host synchronization | Preserve loss and optimizer math; only logging cadence changes when requested | Avoid per-iteration `.item()`/CUDA timing stalls | `train.py` | Low | Static test and later profiler trace |
-| Separate profiles | Baseline and paper-default profiles remain available | Expose speed-first and quality-first A100 commands without claiming either wins | `configs/`, `scripts/`, documentation | Low | Dry-run command checks |
+| Separate profiles | Baseline and paper-default profiles remain available | Expose throughput, aggressive ultra-speed, and quality-control A100 commands without claiming any wins | `configs/`, `scripts/`, documentation | Low | Dry-run command checks |
 
 ## Feature-dimension flow
 
@@ -129,6 +129,7 @@ time.
 | Offer fused Adam only after checking that the installed PyTorch exposes it | Official PyTorch optimizer interface; local legacy environment is PyTorch 1.12.1 | Medium | Use PyTorch's default Adam implementation |
 | Use `D=32, M=2, lambda_sgl=0.01` as the quality-first A100 candidate | Paper reports that quality rises with D and gains diminish beyond D=16; competition does not score model size | Medium | Paper-size `D=16` candidate, selected by controlled scene validation |
 | Keep full input/output resolution, ten offsets, and 30,000 iterations in quality candidates | Competition requirements and SOGS/Scaffold-GS paper protocol | High | Change only after an authorized, controlled resource/quality experiment |
+| Add an explicit ultra-speed profile with resolution 4, `D=8`, `M=1`, five offsets, input ratio 2, no SGL, and densification ending at 7,500 | Inference from the measured workload structure and the user's iteration-rate target; not specified by the paper | Medium | Keep the full-resolution throughput profile, or isolate each change in a controlled ablation |
 | Do not enable whole-model `torch.compile` or AMP in this pass | The renderer is a custom CUDA autograd extension, anchor tensors/optimizer state change during densification, and neither mixed-precision rasterization nor graph capture was verified | High | Add an isolated experiment after extension-level CUDA tests |
 
 ## Verification targets

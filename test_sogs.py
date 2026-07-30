@@ -893,17 +893,44 @@ class StaticIntegrationTests(unittest.TestCase):
         quality = (
             root / "configs" / "sogs_a100_quality.yaml"
         ).read_text(encoding="utf-8")
+        ultra = (
+            root / "configs" / "sogs_a100_ultra.yaml"
+        ).read_text(encoding="utf-8")
         self.assertIn("--sogs_checkpointing False", launcher)
         self.assertIn("--sogs_cache_render_features True", launcher)
         self.assertIn("--tf32_mode enabled", launcher)
         self.assertIn("--tf32_mode disabled", launcher)
         self.assertIn("--appearance_dim 0", launcher)
         self.assertIn("--resolution 1", launcher)
+        self.assertIn("--resolution 4", launcher)
+        self.assertIn("--update_until 7500", launcher)
         self.assertIn("DRY_RUN", launcher)
         self.assertIn("feat_dim: 16", throughput)
         self.assertIn("feat_dim: 32", quality)
         self.assertIn("resolution: 1", throughput)
         self.assertIn("resolution: 1", quality)
+        for expected in (
+            "feat_dim: 8",
+            "num_eigenvectors: 1",
+            "lambda_sgl: 0",
+            "n_offsets: 5",
+            "appearance_dim: 0",
+            "resolution: 4",
+            "ratio: 2",
+            "voxel_size: 0.001",
+            "iterations: 30000",
+            "update_until: 7500",
+            "sogs_chunk_size: 262144",
+            "sogs_checkpointing: false",
+            "sogs_validate_numerics: false",
+            "sogs_cache_render_features: true",
+            "densification_chunk_size: 16384",
+            "tf32_mode: enabled",
+            "cudnn_benchmark: true",
+            "optimizer_backend: auto",
+            "log_interval: 1000",
+        ):
+            self.assertIn(expected, ultra)
 
     def test_a100_max_speed_runner_dry_run_is_non_mutating(self):
         root = Path(__file__).resolve().parent
@@ -942,9 +969,159 @@ class StaticIntegrationTests(unittest.TestCase):
             self.assertIn("--skip_postprocess", result.stdout)
             self.assertIn("--tf32_mode enabled", result.stdout)
             self.assertIn("--log_interval 250", result.stdout)
+            self.assertIn("Profile: A100 throughput", result.stdout)
+            for expected in (
+                "--feat_dim 16",
+                "--num_eigenvectors 2",
+                "--lambda_sgl 0.01",
+                "--n_offsets 10",
+                "--resolution 1",
+                "--ratio 1",
+                "--update_until 15000",
+                "--sogs_chunk_size 65536",
+                "--densification_chunk_size 8192",
+            ):
+                self.assertIn(expected, result.stdout)
             self.assertIn("training was not started", result.stdout)
             self.assertFalse(output_root.exists())
             self.assertFalse(log_root.exists())
+
+            ultra_result = subprocess.run(
+                [
+                    "bash",
+                    str(launcher),
+                    "--profile",
+                    "ultra",
+                    "--dry-run",
+                    "--data-root",
+                    str(data_root),
+                    "--output-root",
+                    str(output_root),
+                    "--log-root",
+                    str(log_root),
+                    "synthetic",
+                ],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertIn("Profile: A100 ultra speed", ultra_result.stdout)
+            for expected in (
+                "--use_second_order True",
+                "--feat_dim 8",
+                "--num_eigenvectors 1",
+                "--lambda_sgl 0",
+                "--n_offsets 5",
+                "--appearance_dim 0",
+                "--resolution 4",
+                "--ratio 2",
+                "--voxel_size 0.001",
+                "--iterations 30000",
+                "--update_until 7500",
+                "--sogs_chunk_size 262144",
+                "--sogs_checkpointing False",
+                "--sogs_validate_numerics False",
+                "--sogs_cache_render_features True",
+                "--densification_chunk_size 16384",
+                "--cudnn_benchmark True",
+                "--tf32_mode enabled",
+                "--optimizer_backend auto",
+                "--log_interval 1000",
+            ):
+                self.assertIn(expected, ultra_result.stdout)
+            for option in (
+                "--feat_dim",
+                "--num_eigenvectors",
+                "--lambda_sgl",
+                "--n_offsets",
+                "--resolution",
+                "--ratio",
+                "--update_until",
+                "--sogs_chunk_size",
+                "--sogs_validate_numerics",
+                "--densification_chunk_size",
+                "--tf32_mode",
+                "--optimizer_backend",
+                "--log_interval",
+            ):
+                self.assertEqual(ultra_result.stdout.count(option), 1)
+            self.assertIn(
+                "training was not started",
+                ultra_result.stdout,
+            )
+            self.assertFalse(output_root.exists())
+            self.assertFalse(log_root.exists())
+
+            quality_result = subprocess.run(
+                [
+                    "bash",
+                    str(launcher),
+                    "--profile",
+                    "quality",
+                    "--dry-run",
+                    "--data-root",
+                    str(data_root),
+                    "--output-root",
+                    str(output_root),
+                    "--log-root",
+                    str(log_root),
+                    "synthetic",
+                ],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertIn(
+                "Profile: A100 quality control",
+                quality_result.stdout,
+            )
+            for expected in (
+                "--feat_dim 32",
+                "--num_eigenvectors 2",
+                "--lambda_sgl 0.01",
+                "--n_offsets 10",
+                "--resolution 1",
+                "--sogs_validate_numerics True",
+                "--tf32_mode disabled",
+                "--optimizer_backend default",
+                "--log_interval 250",
+            ):
+                self.assertIn(expected, quality_result.stdout)
+            self.assertFalse(output_root.exists())
+            self.assertFalse(log_root.exists())
+
+            invalid_result = subprocess.run(
+                [
+                    "bash",
+                    str(launcher),
+                    "--profile",
+                    "bogus",
+                    "--dry-run",
+                ],
+                cwd=root,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(invalid_result.returncode, 0)
+            self.assertIn("unknown profile", invalid_result.stderr)
+            self.assertFalse(output_root.exists())
+            self.assertFalse(log_root.exists())
+
+            missing_result = subprocess.run(
+                ["bash", str(launcher), "--profile"],
+                cwd=root,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(missing_result.returncode, 0)
+            self.assertIn(
+                "--profile requires a value",
+                missing_result.stderr,
+            )
 
 
 if __name__ == "__main__":

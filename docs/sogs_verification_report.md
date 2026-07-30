@@ -83,6 +83,26 @@ Current working-tree follow-up baseline:
   and writes the resolved PyTorch/CUDA/GPU/optimizer/runtime values to
   `runtime_config.json`.
 
+### A100 ultra-speed follow-up (2026-07-30)
+
+- Baseline: branch `feature/sogs-integration`, commit
+  `d1476dca9b2fbac2fa31689e532e3d5dfbcc2aa6`; the only pre-existing dirty path
+  was untracked `docs/runningScript.txt`, which was preserved.
+- Resolution: add an explicit `ultra` profile to the existing A100 launchers
+  without changing their default `throughput` path. Ultra uses
+  `resolution=4`, `D=8`, `M=1`, five offsets, input ratio 2, no SGL, and
+  densification through iteration 7,500. These are workload/quality changes,
+  not method-equivalent runtime optimizations.
+- Runner: `--profile throughput|ultra|quality` is validated before data/output
+  inspection. Every profile has a separate default output/log root and a
+  dynamic runtime summary; no arbitrary value is interpolated into a command
+  or path.
+- Verification: all three one-scene commands passed non-mutating synthetic
+  dry-run tests. The real local seven-scene `data/` tree passed the ultra
+  runner's all-scene dry-run; no GPU work or output/log creation occurred.
+- Training status: no training or rendering was executed. The requested
+  10--20 iteration/s range and all quality metrics remain unmeasured.
+
 ## Files Modified
 
 | File | Reason | Main risk |
@@ -146,6 +166,11 @@ adds `utils/runtime_utils.py`, `utils/checkpoint_utils.py`,
 main risks are unmeasured A100 peak memory and possible score changes from
 TF32/fused Adam; both are isolated to explicit profile settings.
 
+The ultra-speed follow-up adds `configs/sogs_a100_ultra.yaml`, extends both
+A100 launchers and their static/dry-run tests, registers the config in the
+environment verifier, and updates `README.md` plus the three SOGS planning/run
+documents. It does not change core model, renderer, loss, or baseline defaults.
+
 ## Static Checks
 
 | Check | Result | Notes |
@@ -157,8 +182,8 @@ TF32/fused Adam; both are isolated to explicit profile settings.
 | `bash -n` on modified launcher scripts | Passed | No launcher was executed |
 | `git diff --check` | Passed | No whitespace errors in the migration diff |
 | Parser smoke test (`True`, `False`, `--use_second_order`) | Passed | Safe explicit and bare-flag forms |
-| `python test_sogs.py` | Passed (53; 33 skipped) | Base environment has no PyTorch; parser/static/runtime-profile and non-mutating launcher tests ran |
-| `conda run -n depth_anything python test_sogs.py` | Passed (53 tests) | CPU PyTorch 2.12.1+cu130; includes launcher non-mutation, retained/checkpointed gradient equivalence, cache invalidation, optimizer/config/checkpoint round trips, and cached loss kernels |
+| `python test_sogs.py` | Passed (53; 33 skipped) | Base environment has no PyTorch; parser/static/runtime-profile and all A100 non-mutating launcher tests ran |
+| `conda run -n depth_anything python test_sogs.py` | Passed (53 tests) | CPU PyTorch 2.12.1+cu130; includes all three A100 profile dry-runs, retained/checkpointed gradient equivalence, cache invalidation, optimizer/config/checkpoint round trips, and cached loss kernels |
 | Grouped Sobel numerical-equivalence regression | Passed | Uses float32 tolerance because PyTorch 1.12 may accumulate grouped and separate convolutions in a different order; the loss implementation is unchanged |
 | PyTorch 2.12 runtime-policy probe | Passed | Explicit `fp32_precision` API resolved to `tf32`/`ieee` as requested without mixing legacy controls |
 | Adam `auto` construction probe | Passed | CPU fallback resolved to `foreach`; A100 fused execution remains unmeasured |
@@ -168,9 +193,9 @@ TF32/fused Adam; both are isolated to explicit profile settings.
 | `python train_competition.py --help` | Passed | Exposes memory, runtime-budget, and checkpoint-interval controls without starting training |
 | `bash -n scripts/train_sogs_one_hour.sh` | Passed | The bounded launcher was not executed |
 | `bash -n scripts/train_sogs_a100.sh` | Passed | Launcher syntax only |
-| A100 throughput/quality launcher with `DRY_RUN=1` | Passed | Both resolved commands printed; no output directory or training was created |
-| `scripts/run_sogs_a100_max_speed.sh --dry-run` | Passed | Resolved all seven full-speed commands; GPU checks, output/log creation, and training remained disabled |
-| Max-speed synthetic one-scene dry-run test | Passed | Verified TF32/no-eval/logging flags and confirmed no output or log directory was created |
+| A100 throughput/ultra/quality launcher dry-runs | Passed | All resolved commands printed their unique settings exactly once; no output directory or training was created |
+| `scripts/run_sogs_a100_max_speed.sh --profile ultra --dry-run` | Passed | Resolved the real local seven-scene data tree; GPU checks, output/log creation, and training remained disabled |
+| A100 runner error-path dry-runs | Passed | Missing/unknown profiles fail before filesystem or GPU mutation; default remains throughput |
 | One-scene A100 `train_competition.py --dry-run` | Passed | HCM0421 validated (240 train images, 60 poses); all new flags propagated and no training started |
 | Seven-scene `train_competition.py --dry-run` with chunk size 2048 | Passed | Validated all scenes, propagated the memory setting, and created no output directory |
 | `bash -n train.sh single_train.sh scripts/train_sogs.sh` | Passed | Chunk-size propagation syntax only |
@@ -235,6 +260,11 @@ Training was not executed in this environment.
 - TF32 and fused/foreach Adam can change floating-point ordering. The
   throughput profile must be scored against the IEEE-FP32 quality control
   before it is used for a submission.
+- The ultra profile processes about 1/16 as many training pixels and reduces
+  model/anchor capacity and the loss. It may be much faster, but it can
+  materially reduce detail, PSNR, SSIM, LPIPS, and competition score; neither
+  10--20 iteration/s nor acceptable quality is guaranteed without an A100
+  probe.
 - The compact one-hour profile has not been benchmarked on the primary RTX
   4090; its wall-clock stop is deterministic, but completed iterations and
   resulting quality remain scene-dependent.

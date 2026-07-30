@@ -165,40 +165,48 @@ scripts/train_sogs_one_hour.sh \
 This profile disables selective gradient loss and reduces model capacity; it
 is a fast fallback, not the paper-default or competition-optimal configuration.
 
-For the reported A100-SXM4-80GB, two explicit candidates retain activations
+For the reported A100-SXM4-80GB, three explicit candidates retain activations
 instead of checkpoint-recomputing them:
 
 ```bash
 # Print either command without training.
 DRY_RUN=1 scripts/train_sogs_a100.sh throughput \
   data/HCM0421/train outputs/a100_throughput/HCM0421
+DRY_RUN=1 scripts/train_sogs_a100.sh ultra \
+  data/HCM0421/train outputs/a100_ultra_speed/HCM0421
 DRY_RUN=1 scripts/train_sogs_a100.sh quality \
   data/HCM0421/train outputs/a100_quality/HCM0421
 ```
 
-For the fastest prepared full-resolution run across all seven competition
-scenes, use the dedicated one-command launcher. It verifies the environment,
-requires an idle A100, and trains the scenes sequentially:
+The dedicated launcher verifies the environment, requires an idle A100, and
+trains all seven scenes sequentially. Omitting `--profile` preserves the
+full-resolution `throughput` default:
 
 ```bash
-# Preview only; no GPU work or output creation.
+# Preview the full-resolution throughput profile only.
 scripts/run_sogs_a100_max_speed.sh --dry-run
 
-# Starts seven 30,000-iteration training runs.
-scripts/run_sogs_a100_max_speed.sh
+# Preview the aggressive ultra-speed workload only.
+scripts/run_sogs_a100_max_speed.sh --profile ultra --dry-run
+
+# Starts seven ultra-speed 30,000-iteration training runs.
+scripts/run_sogs_a100_max_speed.sh --profile ultra
 ```
 
 The launcher never kills a GPU process and never overwrites a non-empty model
-directory. Logs are written outside the model directories under
-`logs/a100_max_speed/`.
+directory. Ultra models and logs default to `outputs/a100_ultra_speed/` and
+`logs/a100_ultra_speed/`, separate from the other profiles.
 
 The throughput candidate uses paper-size `D=16`, opt-in TF32, and the fastest
 Adam backend supported by the installed PyTorch. The quality-control candidate
 uses `D=32`, explicit IEEE FP32, and the original Adam construction. Both keep
 full image resolution, ten offsets, `M=2`, SGL, a pose-safe zero-dimensional
-appearance embedding, and 30,000 iterations. Neither is claimed
-competition-optimal until controlled PSNR/SSIM/LPIPS measurements are run on
-the actual A100.
+appearance embedding, and 30,000 iterations. Ultra instead uses quarter-width
+and quarter-height training images, `D=8`, `M=1`, five offsets, half of the
+input points, no SGL, and earlier densification. Those changes target a much
+higher iteration rate but can materially reduce reconstruction quality.
+Neither a 10--20 iteration/s rate nor competition-optimal quality is claimed
+until it is measured on the actual A100.
 
 For a complete command-by-command walkthrough, see
 [`docs/sogs_run_guide.md`](docs/sogs_run_guide.md).

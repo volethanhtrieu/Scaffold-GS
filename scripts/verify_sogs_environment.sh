@@ -91,6 +91,7 @@ required_paths=(
     utils/checkpoint_utils.py
     utils/runtime_utils.py
     utils/sogs_utils.py
+    configs/sogs_a100_ultra.yaml
     scripts/run_sogs_a100_max_speed.sh
     scripts/train_sogs_a100.sh
     submodules/diff-gaussian-rasterization/setup.py

@@ -1,0 +1,30 @@
+# A100-SXM4-80GB aggressive iteration-throughput candidate.
+# INFERENCE: this speed-only ablation changes image resolution, model capacity,
+# point sampling, densification duration, and the loss. It is neither the paper
+# default nor a claimed competition-optimal configuration.
+method: sogs_a100_ultra
+use_second_order: true
+feat_dim: 8
+num_eigenvectors: 1
+lambda_sgl: 0
+n_offsets: 5
+appearance_dim: 0
+resolution: 4
+ratio: 2
+voxel_size: 0.001
+iterations: 30000
+update_until: 7500
+
+# Use the A100 memory to amortize chunk launches without recomputation.
+sogs_chunk_size: 262144
+sogs_checkpointing: false
+sogs_validate_numerics: false
+sogs_cache_render_features: true
+densification_chunk_size: 16384
+
+# These speed settings can change floating-point ordering.
+tf32_mode: enabled
+cudnn_benchmark: true
+optimizer_backend: auto
+log_interval: 1000
+disable_gui: true

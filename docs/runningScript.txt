@@ -1,0 +1,40 @@
+Verify first:
+      scripts/verify_sogs_environment.sh \
+    --gpu 0 \
+    --data-root /workspace/Scaffold-GS-SOGS/data
+
+  Preview all seven training commands:
+
+  scripts/run_sogs_a100_max_speed.sh \
+    --data-root /workspace/Scaffold-GS-SOGS/data \
+    --output-root outputs/a100_max_speed \
+    --log-root logs/a100_max_speed \
+    --gpu 0 \
+    --dry-run
+
+  After verification passes, this command starts training all seven scenes:
+
+  scripts/run_sogs_a100_max_speed.sh \
+    --data-root /workspace/Scaffold-GS-SOGS/data \
+    --output-root outputs/a100_max_speed \
+    --log-root logs/a100_max_speed \
+    --gpu 0
+
+  After all seven finish, render:
+
+  python render_test_poses.py \
+    --data-root /workspace/Scaffold-GS-SOGS/data \
+    --model-root outputs/a100_max_speed \
+    --predictions-root predictions/a100_max_speed \
+    --scenes HCM0421 HCM0539 HCM0540 HCM0644 HCM0674 bonsai chair \
+    --iteration 30000 \
+    --gpu 0
+
+  Create the submission:
+
+  python generate_submission.py \
+    --data-root /workspace/Scaffold-GS-SOGS/data \
+    --predictions-root predictions/a100_max_speed \
+    --output submission_round1.zip \
+    --scenes HCM0421 HCM0539 HCM0540 HCM0644 HCM0674 bonsai chair \
+    --filename-mode png
