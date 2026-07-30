@@ -21,6 +21,30 @@ def l2_loss(network_output, gt):
     return ((network_output - gt) ** 2).mean()
 
 
+def scaling_volume_regularization(scaling: torch.Tensor) -> torch.Tensor:
+    """Return the mean XYZ scale product for a ``K x 3`` scaling tensor.
+
+    The renderer emits one positive XYZ scale triplet per selected neural
+    Gaussian.  Explicit component-wise multiplication is mathematically
+    equivalent to ``scaling.prod(dim=1)`` and preserves its gradients.
+    """
+
+    if not isinstance(scaling, torch.Tensor):
+        raise TypeError("scaling must be a torch.Tensor")
+    if scaling.ndim != 2 or scaling.shape[1] != 3:
+        raise ValueError(
+            "scaling must have shape K x 3 "
+            f"(received {tuple(scaling.shape)})"
+        )
+
+    # COMPATIBILITY: torch 1.12's CUDA ``prod`` reduction uses an NVRTC
+    # Jiterator kernel.  Its bundled CUDA 11.6 NVRTC rejects compute
+    # capabilities introduced by newer GPUs.  Ordinary multiply/mean kernels
+    # avoid that runtime compilation without changing the Scaffold-GS loss.
+    volume = scaling[:, 0] * scaling[:, 1] * scaling[:, 2]
+    return volume.mean()
+
+
 def _as_bchw(image: torch.Tensor, name: str):
     """Normalize a CHW/BCHW image to BCHW and return whether it was unbatched."""
 

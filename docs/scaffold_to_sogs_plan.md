@@ -93,6 +93,7 @@ time.
 | The existing PLY format stores only base features; second-order features are recomputed from them | Paper feature augmentation and local PLY serializer | High | Store augmented features (would make configuration-dependent PLY files) |
 | Apply the optional view-adaptive feature-bank weights after second-order augmentation and preserve the full augmented width | Local feature-bank consumer; SOGS paper does not discuss this optional path | Medium | Apply the bank before augmentation or disable it in SOGS mode |
 | Implement without copying an unofficial fork because no such source tree/URL is available in this workspace | Repository inspection and public project page | High | Compare against a user-supplied unofficial repository in a later review |
+| Compute the existing XYZ volume term with explicit component-wise multiplication | Reported PyTorch 1.12.1/CUDA 11.6 NVRTC failure and the renderer's verified `K x 3` scaling shape | High | Upgrade PyTorch/CUDA and rebuild extensions before using the original `prod` reduction |
 
 ## Verification targets
 

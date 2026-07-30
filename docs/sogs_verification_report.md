@@ -8,6 +8,16 @@
 - Dirty files: migration files listed below; no user changes were present at
   baseline
 
+### NVRTC compatibility follow-up (2026-07-30)
+
+- Branch before the fix: `feature/sogs-integration`
+- Commit before the fix: `36a31b5f8f596469fa0ba743f3b80c049f02fe67`
+- Dirty files before the fix: none
+- Reported failure: PyTorch's CUDA `reduction_prod_kernel` stopped at iteration
+  zero with `nvrtc: error: invalid value for --gpu-architecture (-arch)`.
+- Resolution: preserve the original mean XYZ-volume objective using explicit
+  component-wise multiplication, avoiding the legacy NVRTC Jiterator path.
+
 ## Files Modified
 
 | File | Reason | Main risk |
@@ -27,6 +37,17 @@
 | `test_sogs.py` | Small synthetic configuration/shape/numerical/compatibility tests | Full CUDA rasterizer is intentionally not exercised |
 | `docs/scaffold_to_sogs_plan.md`, `docs/sogs_experiment_plan.md`, `docs/sogs_run_guide.md`, `docs/push_sogs_branch.md` | Analysis, run instructions, branch transfer, and later experiment commands | Experiments remain unexecuted |
 
+The NVRTC follow-up modified these files:
+
+| File | Reason | Main risk |
+|---|---|---|
+| `train.py` | Route the existing volume term through the compatibility helper | Accidental loss change |
+| `utils/loss_utils.py` | Compute `sx * sy * sz` without CUDA `Tensor.prod` JIT compilation | CUDA behavior must be checked on the primary GPU |
+| `test_sogs.py` | Verify the exact scalar, gradient, shape contract, and training call site | CPU tests cannot reproduce the reported GPU architecture |
+| `scripts/verify_sogs_environment.sh` | Add a tiny CUDA forward/backward smoke test for the patched loss path | Requires the primary GPU environment |
+| `docs/sogs_run_guide.md` | Document the error signature, preflight, and environment fallback | GPU-specific support still depends on the installed stack |
+| `docs/scaffold_to_sogs_plan.md`, `docs/sogs_verification_report.md` | Record the compatibility rationale and verification status | None |
+
 ## Static Checks
 
 | Check | Result | Notes |
@@ -38,8 +59,11 @@
 | `bash -n` on modified launcher scripts | Passed | No launcher was executed |
 | `git diff --check` | Passed | No whitespace errors in the migration diff |
 | Parser smoke test (`True`, `False`, `--use_second_order`) | Passed | Safe explicit and bare-flag forms |
-| `python test_sogs.py` | Passed (25; 19 skipped) | Base environment has no PyTorch; parser/static tests ran |
-| `conda run -n depth_anything python test_sogs.py` | Passed (25 tests) | CPU PyTorch; unused CUDA/PLY imports were stubbed |
+| `python test_sogs.py` | Passed (28; 21 skipped) | Base environment has no PyTorch; parser/static tests ran |
+| `conda run -n depth_anything python test_sogs.py` | Passed (28 tests) | CPU PyTorch; includes exact volume-loss value and gradient checks |
+| `python -m py_compile train.py render.py scene/gaussian_model.py utils/loss_utils.py test_sogs.py` | Passed | NVRTC compatibility follow-up |
+| `bash -n scripts/verify_sogs_environment.sh` | Passed | CUDA preflight script syntax only |
+| CUDA volume-regularization preflight | Not run here | This workspace has no NVIDIA runtime; run the verifier on the primary GPU |
 | `scripts/verify_sogs_environment.sh --gpu 0 --data-root data` | Correctly failed strict environment check; data passed | Active base environment has no required PyTorch/CUDA stack; NVIDIA CLI tools are absent and all seven scenes passed |
 | `python train.py --help` | Blocked by environment | Active base environment has no NumPy/PyTorch stack |
 | `conda run -n depth_anything python train.py --help` | Blocked by environment | That environment lacks `einops` and the compiled renderer dependencies |

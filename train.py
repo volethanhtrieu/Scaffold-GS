@@ -80,7 +80,12 @@ try:
 except ImportError:
     lpips = None
 from random import randint
-from utils.loss_utils import l1_loss, selective_gradient_loss, ssim
+from utils.loss_utils import (
+    l1_loss,
+    scaling_volume_regularization,
+    selective_gradient_loss,
+    ssim,
+)
 from gaussian_renderer import prefilter_voxel, render, network_gui
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -204,7 +209,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         Ll1 = l1_loss(image, gt_image)
 
         ssim_loss = (1.0 - ssim(image, gt_image))
-        scaling_reg = scaling.prod(dim=1).mean()
+        scaling_reg = scaling_volume_regularization(scaling)
         # COMPATIBILITY: retain the original Scaffold-GS objective exactly
         # when SOGS is disabled or lambda_sgl is zero.
         sgl_loss = image.new_zeros(())

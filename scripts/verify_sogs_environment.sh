@@ -232,8 +232,22 @@ try:
     product = left @ right
     if not bool(torch.isfinite(product).all().item()):
         raise RuntimeError("the CUDA matrix result is non-finite")
+
+    # Exercise the exact volume-loss path used by train.py.  This intentionally
+    # avoids torch.prod, whose NVRTC Jiterator is incompatible with newer GPU
+    # compute capabilities in the repository's legacy torch/CUDA environment.
+    from utils.loss_utils import scaling_volume_regularization
+    scaling = torch.rand((8, 3), device=device, requires_grad=True)
+    scaling_loss = scaling_volume_regularization(scaling)
+    scaling_loss.backward()
+    if not bool(torch.isfinite(scaling_loss).item()):
+        raise RuntimeError("the CUDA volume regularizer is non-finite")
+    if scaling.grad is None or not bool(torch.isfinite(scaling.grad).all().item()):
+        raise RuntimeError("the CUDA volume-regularizer gradient is invalid")
+
     torch.cuda.synchronize()
     print("Small CUDA tensor operation: OK")
+    print("CUDA volume regularization: OK")
 except Exception:
     traceback.print_exc()
     sys.exit(1)

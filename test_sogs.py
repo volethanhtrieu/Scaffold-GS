@@ -22,7 +22,10 @@ from arguments import ModelParams, validate_sogs_config
 try:
     import torch
 
-    from utils.loss_utils import selective_gradient_loss
+    from utils.loss_utils import (
+        scaling_volume_regularization,
+        selective_gradient_loss,
+    )
     from utils.sogs_utils import (
         SecondOrderFeatureAugmentor,
         compute_second_order_statistics,
@@ -244,6 +247,29 @@ class SecondOrderShapeAndNumericalTests(unittest.TestCase):
 
 
 @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch is not installed")
+class VolumeRegularizationCompatibilityTests(unittest.TestCase):
+    def test_value_and_gradient_match_xyz_volume(self):
+        scaling = torch.tensor(
+            [[2.0, 3.0, 4.0], [1.0, 5.0, 2.0]],
+            requires_grad=True,
+        )
+        loss = scaling_volume_regularization(scaling)
+        self.assertEqual(loss.item(), 17.0)
+
+        loss.backward()
+        expected_gradient = torch.tensor(
+            [[6.0, 4.0, 3.0], [5.0, 1.0, 2.5]]
+        )
+        self.assertTrue(torch.equal(scaling.grad, expected_gradient))
+
+    def test_shape_validation(self):
+        with self.assertRaisesRegex(ValueError, "K x 3"):
+            scaling_volume_regularization(torch.ones(2, 4))
+        with self.assertRaisesRegex(ValueError, "K x 3"):
+            scaling_volume_regularization(torch.ones(3))
+
+
+@unittest.skipUnless(TORCH_AVAILABLE, "PyTorch is not installed")
 class SelectiveGradientLossTests(unittest.TestCase):
     def test_unbatched_and_batched_layouts(self):
         prediction = torch.zeros(3, 8, 8)
@@ -424,6 +450,12 @@ class StaticIntegrationTests(unittest.TestCase):
         )
         self.assertIn("pc.get_render_features()", renderer)
         self.assertNotIn("feat = pc._anchor_feat[visible_mask]", renderer)
+
+    def test_training_avoids_nvrtc_prod_reduction(self):
+        root = Path(__file__).resolve().parent
+        training = (root / "train.py").read_text(encoding="utf-8")
+        self.assertIn("scaling_volume_regularization(scaling)", training)
+        self.assertNotIn("scaling.prod(dim=1)", training)
 
 
 if __name__ == "__main__":

@@ -371,6 +371,34 @@ scene's `cfg_args`.
 
 ## 10. Troubleshooting
 
+### `nvrtc: error: invalid value for --gpu-architecture (-arch)`
+
+The long CUDA source dump followed by this message means the legacy
+PyTorch/CUDA runtime tried to JIT-compile an operator for a compute capability
+that its bundled NVRTC does not recognize.  In this repository,
+`environment.yml` pins PyTorch 1.12.1 with CUDA 11.6, so this is especially
+likely on a newer GPU.
+
+The training volume term now uses explicit multiplication of the three XYZ
+scale components instead of PyTorch's NVRTC-backed `prod` reduction.  Run the
+small preflight again before retrying:
+
+```bash
+scripts/verify_sogs_environment.sh --gpu 0 --data-root data
+```
+
+It must print `CUDA volume regularization: OK`.  If another operator later
+reports the same NVRTC error, record the GPU name and compute capability:
+
+```bash
+python -c "import torch; p=torch.cuda.get_device_properties(0); print(torch.__version__, torch.version.cuda, p.name, (p.major, p.minor), torch.cuda.get_arch_list())"
+```
+
+That recurrence requires a PyTorch/CUDA build which supports the reported GPU,
+followed by rebuilding both local CUDA extensions against the same
+environment.  Do not copy extension binaries from a different PyTorch/CUDA
+environment.
+
 ### CUDA or compiled-module import failure
 
 Training and rendering require the differentiable rasterizer and `simple-knn`
