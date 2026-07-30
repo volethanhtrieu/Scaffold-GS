@@ -111,6 +111,7 @@ python train_competition.py \
   --feat-dim 16 \
   --num-eigenvectors 2 \
   --lambda-sgl 0.01 \
+  --sogs-chunk-size 2048 \
   --iterations 30000 \
   --dry-run
 ```
@@ -148,6 +149,7 @@ python train_competition.py \
   --feat-dim 16 \
   --num-eigenvectors 2 \
   --lambda-sgl 0.01 \
+  --sogs-chunk-size 2048 \
   --iterations 30000
 ```
 
@@ -409,10 +411,36 @@ environment does not prove the GPU training environment is ready.
 
 ### Out of GPU memory
 
-Stop the failed run and inspect the GPU capacity and scene resolution before
-changing the method configuration. Do not assume that a lower-dimensional
-profile is competition-optimal without measuring quality. The prepared
-comparison procedure is in
+The SOGS renderer now computes global statistics once, materializes augmented
+features only for visible anchors, and checkpoint-recomputes the SOGS branches
+and attribute-MLP activations in bounded chunks. The same bound caps the
+densification duplicate check. `--sogs-chunk-size` controls these allocations;
+smaller values use less peak VRAM but can reduce throughput. For a 24-GiB card,
+retry a fresh scene output with:
+
+```bash
+python train_competition.py \
+  --data-root data \
+  --output-root outputs/round1 \
+  --scenes HCM0421 HCM0539 HCM0540 HCM0644 HCM0674 bonsai chair \
+  --gpu 0 \
+  --use-second-order True \
+  --feat-dim 16 \
+  --num-eigenvectors 2 \
+  --lambda-sgl 0.01 \
+  --sogs-chunk-size 2048 \
+  --iterations 30000
+```
+
+If the first scene still reports CUDA out-of-memory, stop it and retry with
+`--sogs-chunk-size 1024`. If that remains too large, use the documented compact
+profile (`feat_dim=12`, `num_eigenvectors=1`, `n_offsets=5`) or add
+`--n-offsets 5` to the launcher command; those choices change model capacity
+and must be compared experimentally.
+Move the incomplete per-scene output aside or choose a new output root before
+retrying, because the launcher protects non-empty directories. Do not assume
+that a lower-dimensional profile is competition-optimal without measuring
+quality. The prepared comparison procedure is in
 [`docs/sogs_experiment_plan.md`](sogs_experiment_plan.md).
 
 ### Old or incompatible checkpoint

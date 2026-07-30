@@ -13,7 +13,11 @@ import sys
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence
 
-from arguments import str2bool, validate_sogs_config
+from arguments import (
+    str2bool,
+    validate_sogs_chunk_size,
+    validate_sogs_config,
+)
 from prepare_data import discover_scenes, validate_scene
 
 
@@ -48,6 +52,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--update-init-factor", type=int, default=16)
     parser.add_argument("--feat-dim", type=int, default=32)
     parser.add_argument(
+        "--n-offsets",
+        type=int,
+        default=10,
+        help="Offsets predicted per anchor; lower values reduce renderer VRAM.",
+    )
+    parser.add_argument(
         "--use-second-order",
         type=str2bool,
         nargs="?",
@@ -57,6 +67,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--num-eigenvectors", type=int, default=2)
     parser.add_argument("--lambda-sgl", type=float, default=0.01)
+    parser.add_argument(
+        "--sogs-chunk-size",
+        type=int,
+        default=2048,
+        help=(
+            "Maximum anchors per SOGS/renderer/densification chunk "
+            "(lower uses less VRAM)."
+        ),
+    )
     parser.add_argument(
         "--appearance-dim",
         type=int,
@@ -117,12 +136,16 @@ def training_command(
         str(args.update_init_factor),
         "--feat_dim",
         str(args.feat_dim),
+        "--n_offsets",
+        str(args.n_offsets),
         "--use_second_order",
         str(args.use_second_order),
         "--num_eigenvectors",
         str(args.num_eigenvectors),
         "--lambda_sgl",
         str(args.lambda_sgl),
+        "--sogs_chunk_size",
+        str(args.sogs_chunk_size),
         "--appearance_dim",
         str(args.appearance_dim),
         "--ratio",
@@ -178,8 +201,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     if args.iterations <= 0:
         print("--iterations must be positive", file=sys.stderr)
         return 2
-    if args.appearance_dim < 0 or args.ratio <= 0:
-        print("--appearance-dim must be non-negative and --ratio positive", file=sys.stderr)
+    if args.appearance_dim < 0 or args.ratio <= 0 or args.n_offsets <= 0:
+        print(
+            "--appearance-dim must be non-negative, --ratio positive, "
+            "and --n-offsets positive",
+            file=sys.stderr,
+        )
         return 2
     try:
         validate_sogs_config(
@@ -188,6 +215,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             args.num_eigenvectors,
             args.lambda_sgl,
         )
+        validate_sogs_chunk_size(args.sogs_chunk_size)
     except ValueError as error:
         print(f"invalid SOGS configuration: {error}", file=sys.stderr)
         return 2

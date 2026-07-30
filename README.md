@@ -128,12 +128,18 @@ python train.py -s <scene> -m <output> \
 # SOGS paper reference settings (not competition-tuned)
 python train.py -s <scene> -m <output> \
     --use_second_order True --feat_dim 16 \
-    --num_eigenvectors 2 --lambda_sgl 0.01
+    --num_eigenvectors 2 --lambda_sgl 0.01 \
+    --sogs_chunk_size 2048
 ```
 
 `use_second_order` accepts explicit `True` and `False` values safely.
 `feat_dim` must be positive, `num_eigenvectors` must be between 1 and
 `feat_dim` when SOGS is enabled, and `lambda_sgl` must be non-negative.
+`sogs_chunk_size` controls SOGS, renderer-MLP, and densification tiling; use
+`1024` when a 24-GiB GPU still reaches out-of-memory (smaller values trade
+speed for VRAM).
+The competition launcher also accepts `--n-offsets 5` as a compact renderer
+profile when the offset tensors are the remaining memory bottleneck.
 The saved `cfg_args` and per-iteration `sogs_config.json` record these settings;
 rendering rejects architecture-incompatible checkpoints rather than silently
 initializing missing modules.

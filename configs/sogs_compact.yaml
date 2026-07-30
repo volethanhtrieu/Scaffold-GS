@@ -1,10 +1,11 @@
-# Compact SOGS paper reference profile. Validate quality/memory experimentally
-# before selecting it for a competition submission.
+# Conservative 24-GiB SOGS profile (an implementation inference, not the
+# paper default). Validate quality/memory before a competition submission.
 method: sogs_compact
 use_second_order: true
 feat_dim: 12
-num_eigenvectors: 2
+num_eigenvectors: 1
 lambda_sgl: 0.01
-n_offsets: 10
+# Smaller chunks and fewer offsets trade throughput/capacity for lower VRAM.
+sogs_chunk_size: 1024
+n_offsets: 5
 iterations: 30000
-

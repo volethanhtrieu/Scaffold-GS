@@ -9,11 +9,63 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 import torch
-from einops import repeat
+from torch.utils.checkpoint import checkpoint
 
 import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
+
+
+def _run_attribute_mlp_chunked(
+    module,
+    features,
+    view_direction,
+    distance,
+    *,
+    include_distance,
+    appearance=None,
+    chunk_size=2048,
+    checkpointed=False,
+):
+    """Run one attribute MLP in anchor chunks to cap retained activations."""
+
+    n_rows = features.shape[0]
+    if n_rows == 0:
+        parts = [features, view_direction]
+        if include_distance:
+            parts.append(distance)
+        if appearance is not None:
+            parts.append(appearance)
+        return module(torch.cat(parts, dim=1))
+
+    # COMPATIBILITY: keep the original single-call path for inference and for
+    # small batches; training SOGS uses checkpointed chunks to reduce VRAM.
+    if not checkpointed or n_rows <= chunk_size:
+        parts = [features, view_direction]
+        if include_distance:
+            parts.append(distance)
+        if appearance is not None:
+            parts.append(appearance)
+        return module(torch.cat(parts, dim=1))
+
+    outputs = []
+    for start in range(0, n_rows, chunk_size):
+        end = min(start + chunk_size, n_rows)
+        parts = [features[start:end], view_direction[start:end]]
+        if include_distance:
+            parts.append(distance[start:end])
+        if appearance is not None:
+            parts.append(appearance[start:end])
+        inputs = torch.cat(parts, dim=1)
+        is_script_module = isinstance(module, torch.jit.ScriptModule)
+        if inputs.requires_grad and not is_script_module:
+            # INFERENCE: reentrant checkpointing is supported by the legacy
+            # PyTorch 1.12 environment used by the competition machine.
+            outputs.append(checkpoint(module, inputs))
+        else:
+            outputs.append(module(inputs))
+    return torch.cat(outputs, dim=0)
+
 
 def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask=None, is_training=False):
     ## view frustum filtering for acceleration    
@@ -23,14 +75,16 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     # COMPATIBILITY: every renderer consumer now shares the model-owned feature
     # path.  It returns first-order D features for Scaffold-GS and
     # D*(1+M) second-order features for SOGS.
-    render_features = pc.get_render_features()
+    # COMPATIBILITY: statistics remain scene-global, but branch MLPs only
+    # materialize features for anchors that survive the visibility filter.
+    render_features = pc.get_render_features(visible_mask=visible_mask)
     expected_dim = (
         pc.feat_dim * (1 + pc.num_eigenvectors)
         if pc.use_second_order
         else pc.feat_dim
     )
     assert render_features.shape[-1] == expected_dim
-    feat = render_features[visible_mask]
+    feat = render_features
     anchor = pc.get_anchor[visible_mask]
     grid_offsets = pc._offset[visible_mask]
     grid_scaling = pc.get_scaling[visible_mask]
@@ -70,20 +124,40 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         feat = feat.squeeze(dim=-1) # [n, c]
 
 
-    cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1) # [N, c+3+1]
-    cat_local_view_wodist = torch.cat([feat, ob_view], dim=1) # [N, c+3]
-    assert cat_local_view.shape[1] == expected_dim + 4
-    assert cat_local_view_wodist.shape[1] == expected_dim + 3
+    needs_distance_features = (
+        pc.add_opacity_dist or pc.add_cov_dist or pc.add_color_dist
+    )
+    # COMPATIBILITY: derive widths without allocating duplicate full input
+    # tensors; the chunked helper builds only one anchor slice at a time.
+    assert feat.shape[1] + ob_view.shape[1] == expected_dim + 3
+    if needs_distance_features:
+        assert feat.shape[1] + ob_view.shape[1] + ob_dist.shape[1] == expected_dim + 4
+    chunk_size = getattr(pc, "sogs_chunk_size", 2048)
+    checkpoint_attributes = bool(pc.use_second_order and is_training)
     if pc.appearance_dim > 0:
-        camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * viewpoint_camera.uid
+        # COMPATIBILITY: appearance IDs only need the visible-row count; do
+        # not force construction of the optional distance feature tensor.
+        camera_indicies = torch.ones_like(
+            feat[:, 0],
+            dtype=torch.long,
+            device=ob_dist.device,
+        ) * viewpoint_camera.uid
         # camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * 10
         appearance = pc.get_appearance(camera_indicies)
+    else:
+        appearance = None
 
     # get offset's opacity
-    if pc.add_opacity_dist:
-        neural_opacity = pc.get_opacity_mlp(cat_local_view) # [N, k]
-    else:
-        neural_opacity = pc.get_opacity_mlp(cat_local_view_wodist)
+    neural_opacity = _run_attribute_mlp_chunked(
+        pc.get_opacity_mlp,
+        feat,
+        ob_view,
+        ob_dist,
+        include_distance=pc.add_opacity_dist,
+        appearance=None,
+        chunk_size=chunk_size,
+        checkpointed=checkpoint_attributes,
+    ) # [N, k]
 
     # opacity mask generation
     neural_opacity = neural_opacity.reshape([-1, 1])
@@ -94,34 +168,42 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     opacity = neural_opacity[mask]
 
     # get offset's color
-    if pc.appearance_dim > 0:
-        if pc.add_color_dist:
-            color = pc.get_color_mlp(torch.cat([cat_local_view, appearance], dim=1))
-        else:
-            color = pc.get_color_mlp(torch.cat([cat_local_view_wodist, appearance], dim=1))
-    else:
-        if pc.add_color_dist:
-            color = pc.get_color_mlp(cat_local_view)
-        else:
-            color = pc.get_color_mlp(cat_local_view_wodist)
-    color = color.reshape([anchor.shape[0]*pc.n_offsets, 3])# [mask]
+    color = _run_attribute_mlp_chunked(
+        pc.get_color_mlp,
+        feat,
+        ob_view,
+        ob_dist,
+        include_distance=pc.add_color_dist,
+        appearance=appearance,
+        chunk_size=chunk_size,
+        checkpointed=checkpoint_attributes,
+    )
+    color = color.reshape([anchor.shape[0], pc.n_offsets, 3])
 
     # get offset's cov
-    if pc.add_cov_dist:
-        scale_rot = pc.get_cov_mlp(cat_local_view)
-    else:
-        scale_rot = pc.get_cov_mlp(cat_local_view_wodist)
-    scale_rot = scale_rot.reshape([anchor.shape[0]*pc.n_offsets, 7]) # [mask]
-    
-    # offsets
-    offsets = grid_offsets.view([-1, 3]) # [mask]
-    
-    # combine for parallel masking
-    concatenated = torch.cat([grid_scaling, anchor], dim=-1)
-    concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=pc.n_offsets)
-    concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets], dim=-1)
-    masked = concatenated_all[mask]
-    scaling_repeat, repeat_anchor, color, scale_rot, offsets = masked.split([6, 3, 3, 7, 3], dim=-1)
+    scale_rot = _run_attribute_mlp_chunked(
+        pc.get_cov_mlp,
+        feat,
+        ob_view,
+        ob_dist,
+        include_distance=pc.add_cov_dist,
+        appearance=None,
+        chunk_size=chunk_size,
+        checkpointed=checkpoint_attributes,
+    )
+    scale_rot = scale_rot.reshape([anchor.shape[0], pc.n_offsets, 7])
+
+    # INFERENCE: mask each attribute tensor independently instead of building
+    # and repeating every anchor K times. This removes substantial transient
+    # VRAM at high anchor counts while preserving flattened row-major order.
+    anchor_indices, offset_indices = mask.view(
+        anchor.shape[0], pc.n_offsets
+    ).nonzero(as_tuple=True)
+    scaling_repeat = grid_scaling[anchor_indices]
+    repeat_anchor = anchor[anchor_indices]
+    color = color[anchor_indices, offset_indices]
+    scale_rot = scale_rot[anchor_indices, offset_indices]
+    offsets = grid_offsets[anchor_indices, offset_indices]
     
     # post-process cov
     scaling = scaling_repeat[:,3:] * torch.sigmoid(scale_rot[:,:3]) # * (1+torch.sigmoid(repeat_dist))

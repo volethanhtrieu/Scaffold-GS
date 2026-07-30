@@ -102,6 +102,20 @@ def validate_sogs_config(
     )
 
 
+def validate_sogs_chunk_size(value=2048):
+    """Validate the maximum anchor chunk used by memory-efficient SOGS."""
+
+    if isinstance(value, bool) or not isinstance(value, (str, numbers.Integral)):
+        raise ValueError("sogs_chunk_size must be a positive integer")
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("sogs_chunk_size must be a positive integer") from error
+    if normalized <= 0:
+        raise ValueError("sogs_chunk_size must be a positive integer")
+    return normalized
+
+
 class GroupParams:
     pass
 
@@ -155,6 +169,8 @@ class ModelParams(ParamGroup):
         self.use_second_order = False
         self.num_eigenvectors = 2
         self.lambda_sgl = 0.01
+        # INFERENCE: 2048 bounds SOGS branch activation memory on 24-GiB GPUs.
+        self.sogs_chunk_size = 2048
         self.n_offsets = 10
         self.voxel_size =  0.001 # if voxel_size<=0, using 1nn dist
         self.update_depth = 3
@@ -197,6 +213,8 @@ class ModelParams(ParamGroup):
             g.num_eigenvectors = 2
         if getattr(g, "lambda_sgl", None) is None:
             g.lambda_sgl = 0.01
+        if getattr(g, "sogs_chunk_size", None) is None:
+            g.sogs_chunk_size = 2048
         (
             g.feat_dim,
             g.use_second_order,
@@ -208,6 +226,7 @@ class ModelParams(ParamGroup):
             g.num_eigenvectors,
             g.lambda_sgl,
         )
+        g.sogs_chunk_size = validate_sogs_chunk_size(g.sogs_chunk_size)
         g.source_path = os.path.abspath(g.source_path)
         return g
 

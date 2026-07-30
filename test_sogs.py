@@ -17,7 +17,11 @@ from argparse import ArgumentParser
 from pathlib import Path
 from types import SimpleNamespace
 
-from arguments import ModelParams, validate_sogs_config
+from arguments import (
+    ModelParams,
+    validate_sogs_chunk_size,
+    validate_sogs_config,
+)
 
 try:
     import torch
@@ -69,6 +73,18 @@ def install_extension_import_stubs():
         extension.distCUDA2 = unavailable_distance
         sys.modules["simple_knn"] = package
         sys.modules["simple_knn._C"] = extension
+    if importlib.util.find_spec("diff_gaussian_rasterization") is None:
+        module = types.ModuleType("diff_gaussian_rasterization")
+
+        class UnavailableRasterizer:
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError(
+                    "the CUDA rasterizer is unavailable in this CPU-only test"
+                )
+
+        module.GaussianRasterizationSettings = UnavailableRasterizer
+        module.GaussianRasterizer = UnavailableRasterizer
+        sys.modules["diff_gaussian_rasterization"] = module
     if importlib.util.find_spec("colorama") is None:
         module = types.ModuleType("colorama")
 
@@ -95,12 +111,15 @@ try:
     if TORCH_AVAILABLE:
         install_extension_import_stubs()
         from scene.gaussian_model import GaussianModel
+        from gaussian_renderer import generate_neural_gaussians
         MODEL_IMPORT_ERROR = None
     else:
         GaussianModel = None
+        generate_neural_gaussians = None
         MODEL_IMPORT_ERROR = "PyTorch is not installed"
 except (ImportError, OSError) as error:
     GaussianModel = None
+    generate_neural_gaussians = None
     MODEL_IMPORT_ERROR = str(error)
 
 
@@ -190,6 +209,14 @@ class ConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "lambda_sgl"):
             validate_sogs_config(4, True, 1, math.nan)
 
+    def test_sogs_chunk_size_validation(self):
+        self.assertEqual(validate_sogs_chunk_size("1024"), 1024)
+        self.assertEqual(validate_sogs_chunk_size(4096), 4096)
+        for invalid in (0, -1, True, 1.5, "not-an-int"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "sogs_chunk_size"):
+                    validate_sogs_chunk_size(invalid)
+
 
 @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch is not installed")
 class SecondOrderShapeAndNumericalTests(unittest.TestCase):
@@ -208,6 +235,17 @@ class SecondOrderShapeAndNumericalTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(augmented).all().item())
         self.assertIsNotNone(features.grad)
         self.assertTrue(torch.isfinite(features.grad).all().item())
+
+    def test_chunked_checkpoint_path_keeps_gradients_finite(self):
+        features = torch.nn.Parameter(torch.randn(9, 4))
+        augmentor = SecondOrderFeatureAugmentor(4, 2, chunk_size=2)
+        loss = augmentor(features).square().mean()
+        loss.backward()
+        self.assertIsNotNone(features.grad)
+        self.assertTrue(torch.isfinite(features.grad).all().item())
+        for parameter in augmentor.parameters():
+            self.assertIsNotNone(parameter.grad)
+            self.assertTrue(torch.isfinite(parameter.grad).all().item())
 
     def test_constant_features(self):
         features = torch.ones(4, 3, requires_grad=True)
@@ -350,7 +388,7 @@ class SelectiveGradientLossTests(unittest.TestCase):
     "GaussianModel dependencies are not installed: " + str(MODEL_IMPORT_ERROR),
 )
 class ModelCompatibilityTests(unittest.TestCase):
-    def make_model(self, enabled):
+    def make_model(self, enabled, *, chunk_size=2048):
         model = GaussianModel(
             feat_dim=4,
             n_offsets=2,
@@ -358,6 +396,7 @@ class ModelCompatibilityTests(unittest.TestCase):
             use_second_order=enabled,
             num_eigenvectors=2,
             lambda_sgl=0.01,
+            sogs_chunk_size=chunk_size,
             device="cpu",
         )
         model._anchor = torch.nn.Parameter(torch.randn(3, 3))
@@ -397,6 +436,101 @@ class ModelCompatibilityTests(unittest.TestCase):
         baseline = self.make_model(False)
         self.assertIsNone(baseline.second_order_augmentor)
         self.assertIs(baseline.get_render_features(), baseline._anchor_feat)
+
+    def test_visible_feature_accessor_only_augments_selected_rows(self):
+        model = self.make_model(True)
+        visible = torch.tensor([True, False, True])
+        all_features = model.get_render_features()
+        visible_features = model.get_render_features(visible_mask=visible)
+        self.assertEqual(tuple(visible_features.shape), (2, 12))
+        self.assertTrue(torch.allclose(visible_features, all_features[visible]))
+
+    def test_chunk_size_is_saved_in_model_configuration(self):
+        model = self.make_model(True, chunk_size=1024)
+        self.assertEqual(model.get_sogs_config()["sogs_chunk_size"], 1024)
+
+    def test_chunk_size_can_change_when_loading_weights(self):
+        source = self.make_model(True, chunk_size=1024)
+        state = source.capture()
+        restored = self.make_model(True, chunk_size=2048)
+        restored.restore(state, optimization_args())
+        self.assertEqual(restored.sogs_chunk_size, 2048)
+
+    def test_memory_efficient_renderer_forward_and_backward(self):
+        model = self.make_model(True, chunk_size=1)
+        with torch.no_grad():
+            model.mlp_opacity[2].weight.zero_()
+            model.mlp_opacity[2].bias.copy_(torch.tensor([1.0, -1.0]))
+        camera = SimpleNamespace(
+            camera_center=torch.zeros(3),
+            uid=0,
+        )
+        visible = torch.tensor([True, False, True])
+        (
+            xyz,
+            color,
+            opacity,
+            scaling,
+            rotation,
+            neural_opacity,
+            selection_mask,
+        ) = generate_neural_gaussians(
+            camera,
+            model,
+            visible_mask=visible,
+            is_training=True,
+        )
+        self.assertEqual(tuple(xyz.shape), (2, 3))
+        self.assertEqual(tuple(color.shape), (2, 3))
+        self.assertEqual(tuple(opacity.shape), (2, 1))
+        self.assertEqual(tuple(scaling.shape), (2, 3))
+        self.assertEqual(tuple(rotation.shape), (2, 4))
+        self.assertEqual(tuple(neural_opacity.shape), (4, 1))
+        self.assertEqual(tuple(selection_mask.shape), (4,))
+        self.assertEqual(
+            selection_mask.tolist(),
+            [True, False, True, False],
+        )
+        loss = (
+            xyz.square().mean()
+            + color.square().mean()
+            + opacity.square().mean()
+            + scaling.square().mean()
+            + rotation.square().mean()
+        )
+        loss.backward()
+        self.assertIsNotNone(model._anchor_feat.grad)
+        self.assertTrue(torch.isfinite(model._anchor_feat.grad).all().item())
+
+    def test_memory_efficient_training_statistics_index_mapping(self):
+        model = self.make_model(True)
+        model.opacity_accum = torch.zeros(3, 1)
+        model.anchor_demon = torch.zeros(3, 1)
+        model.offset_gradient_accum = torch.zeros(6, 1)
+        model.offset_denom = torch.zeros(6, 1)
+        viewspace = torch.zeros(2, 3, requires_grad=True)
+        viewspace.grad = torch.tensor(
+            [[3.0, 4.0, 0.0], [6.0, 8.0, 0.0]]
+        )
+        model.training_statis(
+            viewspace_point_tensor=viewspace,
+            opacity=torch.tensor([[0.1], [-0.2], [0.3], [0.4]]),
+            update_filter=torch.tensor([True, False]),
+            offset_selection_mask=torch.tensor([True, False, False, True]),
+            anchor_visible_mask=torch.tensor([True, False, True]),
+        )
+        self.assertTrue(
+            torch.allclose(
+                model.opacity_accum,
+                torch.tensor([[0.1], [0.0], [0.7]]),
+            )
+        )
+        self.assertTrue(
+            torch.equal(model.anchor_demon, torch.tensor([[1.0], [0.0], [1.0]]))
+        )
+        self.assertEqual(model.offset_gradient_accum[0].item(), 5.0)
+        self.assertEqual(model.offset_denom[0].item(), 1.0)
+        self.assertEqual(model.offset_gradient_accum[5].item(), 0.0)
 
     def test_optimizer_contains_second_order_parameters(self):
         model = self.make_model(True)
@@ -475,7 +609,9 @@ class StaticIntegrationTests(unittest.TestCase):
         renderer = (root / "gaussian_renderer" / "__init__.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn("pc.get_render_features()", renderer)
+        self.assertIn("pc.get_render_features(visible_mask=visible_mask)", renderer)
+        self.assertIn("_run_attribute_mlp_chunked", renderer)
+        self.assertNotIn("concatenated_all", renderer)
         self.assertNotIn("feat = pc._anchor_feat[visible_mask]", renderer)
 
     def test_training_avoids_nvrtc_prod_reduction(self):
@@ -483,6 +619,15 @@ class StaticIntegrationTests(unittest.TestCase):
         training = (root / "train.py").read_text(encoding="utf-8")
         self.assertIn("scaling_volume_regularization(scaling)", training)
         self.assertNotIn("scaling.prod(dim=1)", training)
+
+    def test_sogs_chunk_budget_reaches_densification(self):
+        root = Path(__file__).resolve().parent
+        model = (root / "scene" / "gaussian_model.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("min(1024, self.sogs_chunk_size)", model)
+        self.assertIn("remove_duplicates.logical_or_", model)
+        self.assertNotIn("remove_duplicates_list", model)
 
 
 if __name__ == "__main__":

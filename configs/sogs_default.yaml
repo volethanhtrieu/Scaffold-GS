@@ -4,6 +4,7 @@ use_second_order: true
 feat_dim: 16
 num_eigenvectors: 2
 lambda_sgl: 0.01
+# Runtime memory control: lower this from 2048 to 1024 if a 24-GiB GPU OOMs.
+sogs_chunk_size: 2048
 n_offsets: 10
 iterations: 30000
-

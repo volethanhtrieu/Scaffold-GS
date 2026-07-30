@@ -29,6 +29,30 @@
 - Resolution: clamp variance to `eps²` before `sqrt`, while retaining the
   explicit zero-variance correlation mask and identity diagonal.
 
+### 24-GiB VRAM follow-up (2026-07-30)
+
+- Reported failure: SOGS training exceeded the available GPU memory after
+  second-order features were enabled.
+- Resolution: keep covariance/eigendecomposition scene-global, augment only
+  anchors selected by the renderer visibility mask, checkpoint branch MLP
+  and renderer MLP activations in bounded chunks, and mask renderer attributes
+  without constructing the former `N*n_offsets x 22` concatenation. Expose
+  `sogs_chunk_size` through the launcher, `cfg_args`, and checkpoint metadata.
+  The competition launcher also exposes `--n-offsets` for the renderer's
+  largest per-anchor tensors. Densification statistics now map selected offsets
+  directly instead of allocating and cloning scene-wide boolean masks, while
+  duplicate checks reduce each chunk in-place instead of retaining every
+  intermediate mask.
+- Runtime guidance: start with `--sogs-chunk-size 2048`; use `1024` if the
+  first setting still reaches CUDA out-of-memory. This is a memory/performance
+  control and does not change the augmented feature dimension.
+
+Current working-tree follow-up baseline:
+
+- Branch: `feature/sogs-integration`
+- Commit before these VRAM edits: `707931c8` (zero-variance fix)
+- Training: not executed
+
 ## Files Modified
 
 | File | Reason | Main risk |
@@ -47,6 +71,16 @@
 | `configs/*.yaml`, `scripts/*.sh` | Reference profiles, opt-in launchers, and strict environment verification | Defaults are reference values, not tuned results |
 | `test_sogs.py` | Small synthetic configuration/shape/numerical/compatibility tests | Full CUDA rasterizer is intentionally not exercised |
 | `docs/scaffold_to_sogs_plan.md`, `docs/sogs_experiment_plan.md`, `docs/sogs_run_guide.md`, `docs/push_sogs_branch.md` | Analysis, run instructions, branch transfer, and later experiment commands | Experiments remain unexecuted |
+
+The VRAM follow-up additionally modified `arguments/__init__.py`,
+`utils/sogs_utils.py`, `scene/gaussian_model.py`,
+`gaussian_renderer/__init__.py`, `train.py`, `render.py`,
+`render_test_poses.py`, `train_competition.py`, `test_sogs.py`,
+`configs/sogs_default.yaml`, `configs/sogs_compact.yaml`, `train.sh`,
+`single_train.sh`, `scripts/train_sogs.sh`, `README.md`,
+`COMPETITION_PIPELINE.md`, `docs/scaffold_to_sogs_plan.md`, and this report/run
+guide. The main risk is a throughput reduction from activation recomputation;
+the base feature and checkpoint architecture remain unchanged.
 
 The NVRTC follow-up modified these files:
 
@@ -76,11 +110,14 @@ gradients.
 | `bash -n` on modified launcher scripts | Passed | No launcher was executed |
 | `git diff --check` | Passed | No whitespace errors in the migration diff |
 | Parser smoke test (`True`, `False`, `--use_second_order`) | Passed | Safe explicit and bare-flag forms |
-| `python test_sogs.py` | Passed (29; 22 skipped) | Base environment has no PyTorch; parser/static tests ran |
-| `conda run -n depth_anything python test_sogs.py` | Passed (29 tests) | CPU PyTorch; includes volume-loss and zero-initialized SOGS gradient checks |
+| `python test_sogs.py` | Passed (37; 28 skipped) | Base environment has no PyTorch; parser/static tests ran |
+| `conda run -n depth_anything python test_sogs.py` | Passed (37 tests) | CPU PyTorch; includes visible-row augmentation, chunked renderer forward/backward, memory-efficient statistics indexing, checkpoint gradients, and chunk-size validation |
 | 30-step zero-initialized SOGS optimizer probe | Passed | Features and gradients remained finite for every synthetic step |
 | `python -m py_compile train.py render.py scene/gaussian_model.py utils/sogs_utils.py utils/loss_utils.py test_sogs.py` | Passed | NVRTC and zero-variance compatibility follow-ups |
 | `bash -n scripts/verify_sogs_environment.sh` | Passed | CUDA preflight script syntax only |
+| `python train_competition.py --help` | Passed | Exposes `--sogs-chunk-size` and `--n-offsets` without starting training |
+| Seven-scene `train_competition.py --dry-run` with chunk size 2048 | Passed | Validated all scenes, propagated the memory setting, and created no output directory |
+| `bash -n train.sh single_train.sh scripts/train_sogs.sh` | Passed | Chunk-size propagation syntax only |
 | CUDA volume/SOGS-backward preflight | Not run here | This workspace has no NVIDIA runtime; run the verifier on the primary GPU |
 | `scripts/verify_sogs_environment.sh --gpu 0 --data-root data` | Correctly failed strict environment check; data passed | Active base environment has no required PyTorch/CUDA stack; NVIDIA CLI tools are absent and all seven scenes passed |
 | `python train.py --help` | Blocked by environment | Active base environment has no NumPy/PyTorch stack |

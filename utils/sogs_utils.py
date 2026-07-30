@@ -18,6 +18,7 @@ from typing import NamedTuple, Optional, Tuple
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 
 class SecondOrderStatistics(NamedTuple):
@@ -231,6 +232,7 @@ class SecondOrderFeatureAugmentor(nn.Module):
         num_eigenvectors: int = 2,
         *,
         hidden_dim: Optional[int] = None,
+        chunk_size: int = 2048,
     ) -> None:
         super().__init__()
         validate_second_order_dimensions(
@@ -241,8 +243,15 @@ class SecondOrderFeatureAugmentor(nn.Module):
         hidden = feat_dim if hidden_dim is None else int(hidden_dim)
         if hidden <= 0:
             raise ValueError("hidden_dim must be positive")
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
+            raise ValueError("chunk_size must be a positive integer")
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be a positive integer")
         # PAPER: each Fi is a two-layer MLP with ReLU activation.  The paper
         # does not prescribe a hidden width; using D preserves local MLP scale.
+        # INFERENCE: chunked checkpointing bounds feature-branch activation
+        # memory for large anchor sets while preserving the differentiable path.
+        self.chunk_size = chunk_size
         self.branches = nn.ModuleList(
             [
                 nn.Sequential(
@@ -260,7 +269,33 @@ class SecondOrderFeatureAugmentor(nn.Module):
 
         return self.feat_dim * (1 + self.num_eigenvectors)
 
-    def forward(self, anchor_features: torch.Tensor) -> torch.Tensor:
+    def _augment_chunk(
+        self,
+        anchor_features: torch.Tensor,
+        eigenvectors: torch.Tensor,
+    ) -> torch.Tensor:
+        """Augment one anchor chunk; kept separate for checkpointing."""
+
+        branches = [anchor_features]
+        for index, branch in enumerate(self.branches):
+            eigenvector = eigenvectors[:, index].to(
+                device=anchor_features.device, dtype=anchor_features.dtype
+            )
+            eigenvector = eigenvector.unsqueeze(0).expand(anchor_features.shape[0], -1)
+            # PAPER: combine the global principal direction Pi and local fa.
+            branch_input = torch.cat([eigenvector, anchor_features], dim=-1)
+            parameter = next(branch.parameters(), None)
+            if parameter is not None:
+                branch_input = branch_input.to(dtype=parameter.dtype)
+            branches.append(branch(branch_input).to(dtype=anchor_features.dtype))
+        return torch.cat(branches, dim=-1)
+
+    def forward(
+        self,
+        anchor_features: torch.Tensor,
+        *,
+        output_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if not isinstance(anchor_features, torch.Tensor):
             raise TypeError("anchor_features must be a torch.Tensor")
         if anchor_features.ndim != 2:
@@ -273,6 +308,17 @@ class SecondOrderFeatureAugmentor(nn.Module):
                 f"expected base feature dimension {self.feat_dim}, "
                 f"received {anchor_features.shape[1]}"
             )
+        if output_mask is not None:
+            if not isinstance(output_mask, torch.Tensor):
+                raise TypeError("output_mask must be a torch.Tensor")
+            if output_mask.ndim != 1 or output_mask.shape[0] != anchor_features.shape[0]:
+                raise ValueError(
+                    "output_mask must have shape [N] matching anchor_features"
+                )
+            if output_mask.dtype != torch.bool:
+                raise ValueError("output_mask must use torch.bool dtype")
+            if output_mask.device != anchor_features.device:
+                raise ValueError("output_mask and anchor_features must share a device")
         if not anchor_features.is_floating_point():
             raise ValueError("anchor_features must use a floating-point dtype")
         if not torch.isfinite(anchor_features).all().item():
@@ -280,28 +326,33 @@ class SecondOrderFeatureAugmentor(nn.Module):
         if self.num_eigenvectors == 0:
             return anchor_features
 
+        selected_features = (
+            anchor_features if output_mask is None else anchor_features[output_mask]
+        )
+        if selected_features.shape[0] == 0:
+            return selected_features.reshape(0, self.augmented_dim)
+
+        # PAPER: statistics are computed from all scene anchors, even when
+        # only visible anchors are requested by the renderer.
         statistics = compute_second_order_statistics(
             anchor_features, self.num_eigenvectors
         )
-        n_anchors = anchor_features.shape[0]
-        branches = []
-        for index, branch in enumerate(self.branches):
-            eigenvector = statistics.eigenvectors[:, index].to(
-                device=anchor_features.device, dtype=anchor_features.dtype
-            )
-            eigenvector = eigenvector.unsqueeze(0).expand(n_anchors, -1)
-            # PAPER: combine the global principal direction Pi and local fa.
-            branch_input = torch.cat([eigenvector, anchor_features], dim=-1)
-            # INFERENCE: promote branch input to the parameter dtype for
-            # float16/bfloat16 callers, then return each branch in the source
-            # feature dtype.
-            parameter = next(branch.parameters(), None)
-            if parameter is not None:
-                branch_input = branch_input.to(dtype=parameter.dtype)
-            branch_output = branch(branch_input).to(dtype=anchor_features.dtype)
-            branches.append(branch_output)
+        eigenvectors = statistics.eigenvectors
+        chunks = []
+        for start in range(0, selected_features.shape[0], self.chunk_size):
+            chunk = selected_features[start : start + self.chunk_size]
+            if self.training and chunk.requires_grad:
+                # INFERENCE: recompute branch activations during backward to
+                # bound peak VRAM. PyTorch's default reentrant checkpoint is
+                # available in the repository's legacy torch 1.12 runtime.
+                augmented_chunk = checkpoint(
+                    self._augment_chunk, chunk, eigenvectors
+                )
+            else:
+                augmented_chunk = self._augment_chunk(chunk, eigenvectors)
+            chunks.append(augmented_chunk)
 
-        augmented_features = torch.cat([anchor_features] + branches, dim=-1)
+        augmented_features = torch.cat(chunks, dim=0)
         expected_dim = self.feat_dim * (1 + self.num_eigenvectors)
         assert augmented_features.shape[-1] == expected_dim
         if not torch.isfinite(augmented_features).all().item():

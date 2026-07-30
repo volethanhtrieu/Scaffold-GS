@@ -264,6 +264,7 @@ def render_scene(
         use_second_order=str2bool(config.get("use_second_order", False)),
         num_eigenvectors=int(config.get("num_eigenvectors", 2)),
         lambda_sgl=float(config.get("lambda_sgl", 0.01)),
+        sogs_chunk_size=int(config.get("sogs_chunk_size", 2048)),
     )
     model.load_ply_sparse_gaussian(str(iteration_dir / "point_cloud.ply"))
     model.load_mlp_checkpoints(str(iteration_dir))

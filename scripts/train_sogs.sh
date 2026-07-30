@@ -23,6 +23,7 @@ command=(
     --feat_dim 16
     --num_eigenvectors 2
     --lambda_sgl 0.01
+    --sogs_chunk_size 2048
     "$@"
 )
 
@@ -30,4 +31,3 @@ printf 'Resolved command:'
 printf ' %q' "${command[@]}"
 printf '\n'
 "${command[@]}"
-

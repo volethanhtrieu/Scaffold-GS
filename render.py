@@ -92,6 +92,7 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
             use_second_order=dataset.use_second_order,
             num_eigenvectors=dataset.num_eigenvectors,
             lambda_sgl=dataset.lambda_sgl,
+            sogs_chunk_size=dataset.sogs_chunk_size,
         )
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         

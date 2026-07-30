@@ -10,7 +10,6 @@
 #
 
 import torch
-from functools import reduce
 import numpy as np
 import json
 from torch_scatter import scatter_max
@@ -27,7 +26,7 @@ from utils.sogs_utils import (
     SecondOrderFeatureAugmentor,
     validate_second_order_dimensions,
 )
-from arguments import validate_sogs_config
+from arguments import validate_sogs_chunk_size, validate_sogs_config
 
     
 class GaussianModel:
@@ -67,6 +66,7 @@ class GaussianModel:
                  num_eigenvectors: int = 2,
                  lambda_sgl: float = 0.01,
                  device=None,
+                 sogs_chunk_size: int = 2048,
                  ):
 
         # COMPATIBILITY: append SOGS settings after the original positional
@@ -87,6 +87,7 @@ class GaussianModel:
             self.num_eigenvectors,
             enabled=self.use_second_order,
         )
+        self.sogs_chunk_size = validate_sogs_chunk_size(sogs_chunk_size)
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
@@ -137,7 +138,9 @@ class GaussianModel:
         # concatenate branch outputs with the original anchor feature.
         self.second_order_augmentor = (
             SecondOrderFeatureAugmentor(
-                self.feat_dim, self.num_eigenvectors
+                self.feat_dim,
+                self.num_eigenvectors,
+                chunk_size=self.sogs_chunk_size,
             ).to(self.device)
             if self.use_second_order
             else None
@@ -211,13 +214,14 @@ class GaussianModel:
 
         return self.render_feat_dim
 
-    def get_render_features(self):
+    def get_render_features(self, visible_mask=None):
         """Return base or second-order-augmented anchor features.
 
         The returned tensor has shape ``[N, D]`` for Scaffold-GS and
         ``[N, D * (1 + M)]`` for SOGS.  Statistics are intentionally computed
-        before renderer visibility masking so the correlation patterns remain
-        scene-global rather than view-dependent.
+        from all anchors before optional renderer visibility masking so the
+        correlation patterns remain scene-global rather than view-dependent.
+        When ``visible_mask`` is supplied, only visible rows are augmented.
         """
 
         features = self._anchor_feat
@@ -228,16 +232,32 @@ class GaussianModel:
                 "anchor feature tensor must have shape "
                 f"[N, {self.feat_dim}], received {tuple(features.shape)}"
             )
+        if visible_mask is not None:
+            if not isinstance(visible_mask, torch.Tensor):
+                raise TypeError("visible_mask must be a torch.Tensor")
+            if (
+                visible_mask.ndim != 1
+                or visible_mask.shape[0] != features.shape[0]
+            ):
+                raise ValueError(
+                    "visible_mask must have shape [N] matching anchor features"
+                )
+            if visible_mask.dtype != torch.bool:
+                raise ValueError("visible_mask must use torch.bool dtype")
+            if visible_mask.device != features.device:
+                raise ValueError("visible_mask and anchor features must share a device")
         if not self.use_second_order:
             expected_dim = self.feat_dim
             assert features.shape[-1] == expected_dim
-            return features
+            return features if visible_mask is None else features[visible_mask]
         if self.second_order_augmentor is None:
             raise RuntimeError(
                 "SOGS is enabled but its second-order augmentor is not initialized"
             )
         # PAPER: expose one feature path to every renderer consumer.
-        augmented_features = self.second_order_augmentor(features)
+        augmented_features = self.second_order_augmentor(
+            features, output_mask=visible_mask
+        )
         expected_dim = self.feat_dim * (1 + self.num_eigenvectors)
         assert augmented_features.shape[-1] == expected_dim
         return augmented_features
@@ -251,6 +271,7 @@ class GaussianModel:
             "lambda_sgl": float(self.lambda_sgl),
             "feat_dim": int(self.feat_dim),
             "render_feat_dim": int(self.render_feat_dim),
+            "sogs_chunk_size": int(self.sogs_chunk_size),
         }
 
     def _assert_checkpoint_compatible(self, checkpoint_config, *, source="checkpoint"):
@@ -281,14 +302,28 @@ class GaussianModel:
             "lambda_sgl",
             "feat_dim",
             "render_feat_dim",
+            "sogs_chunk_size",
         ):
             if key not in checkpoint_config:
-                if self.use_second_order:
+                # COMPATIBILITY: older SOGS checkpoints predate the runtime
+                # memory knob; the default chunk size is safe for loading.
+                if self.use_second_order and key != "sogs_chunk_size":
                     raise RuntimeError(
                         f"{source} is missing required SOGS setting {key!r}"
                     )
                 continue
             actual = checkpoint_config[key]
+            if key == "sogs_chunk_size":
+                # INFERENCE: this only controls activation tiling, so a
+                # checkpoint can safely be rendered with a different VRAM
+                # budget without changing its learned architecture.
+                try:
+                    validate_sogs_chunk_size(actual)
+                except ValueError as error:
+                    raise RuntimeError(
+                        f"invalid {source} setting sogs_chunk_size={actual!r}"
+                    ) from error
+                continue
             if key == "lambda_sgl":
                 try:
                     matches = abs(float(actual) - expected[key]) <= 1e-12
@@ -1027,15 +1062,27 @@ class GaussianModel:
         self.anchor_demon[anchor_visible_mask] += 1
 
         # update neural gaussian statis
-        anchor_visible_mask = anchor_visible_mask.unsqueeze(dim=1).repeat([1, self.n_offsets]).view(-1)
-        combined_mask = torch.zeros_like(self.offset_gradient_accum, dtype=torch.bool).squeeze(dim=1)
-        combined_mask[anchor_visible_mask] = offset_selection_mask
-        temp_mask = combined_mask.clone()
-        combined_mask[temp_mask] = update_filter
-        
+        # INFERENCE: map visible local offsets directly back to their global
+        # indices. This avoids two full-size boolean masks and a repeated
+        # anchor-visible mask during every densification-statistics update.
+        visible_anchor_indices = anchor_visible_mask.nonzero(
+            as_tuple=False
+        ).squeeze(dim=1)
+        local_offsets = torch.arange(
+            self.n_offsets,
+            dtype=visible_anchor_indices.dtype,
+            device=visible_anchor_indices.device,
+        )
+        global_offset_indices = (
+            visible_anchor_indices[:, None] * self.n_offsets
+            + local_offsets[None, :]
+        ).reshape(-1)
+        selected_global_indices = global_offset_indices[offset_selection_mask]
+        updated_global_indices = selected_global_indices[update_filter]
+
         grad_norm = torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
-        self.offset_gradient_accum[combined_mask] += grad_norm
-        self.offset_denom[combined_mask] += 1
+        self.offset_gradient_accum[updated_global_indices] += grad_norm
+        self.offset_denom[updated_global_indices] += 1
 
         
 
@@ -1138,14 +1185,26 @@ class GaussianModel:
             ## split data for reducing peak memory calling
             use_chunk = True
             if use_chunk:
-                chunk_size = 4096
+                # INFERENCE: reuse the SOGS runtime budget for the large
+                # densification duplicate-check tensor and cap it at 1024 for
+                # 24-GiB cards. Preserve Scaffold-GS's original 4096-row chunk
+                # when second-order mode is disabled.
+                chunk_size = (
+                    min(1024, self.sogs_chunk_size)
+                    if self.use_second_order
+                    else 4096
+                )
                 max_iters = grid_coords.shape[0] // chunk_size + (1 if grid_coords.shape[0] % chunk_size != 0 else 0)
-                remove_duplicates_list = []
+                # INFERENCE: accumulate the reduction in-place instead of
+                # retaining one [candidate_count] boolean tensor per chunk.
+                remove_duplicates = torch.zeros(
+                    selected_grid_coords_unique.shape[0],
+                    dtype=torch.bool,
+                    device=selected_grid_coords_unique.device,
+                )
                 for i in range(max_iters):
                     cur_remove_duplicates = (selected_grid_coords_unique.unsqueeze(1) == grid_coords[i*chunk_size:(i+1)*chunk_size, :]).all(-1).any(-1).view(-1)
-                    remove_duplicates_list.append(cur_remove_duplicates)
-                
-                remove_duplicates = reduce(torch.logical_or, remove_duplicates_list)
+                    remove_duplicates.logical_or_(cur_remove_duplicates)
             else:
                 remove_duplicates = (selected_grid_coords_unique.unsqueeze(1) == grid_coords).all(-1).any(-1).view(-1)
 

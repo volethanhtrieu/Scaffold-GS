@@ -151,6 +151,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         use_second_order=dataset.use_second_order,
         num_eigenvectors=dataset.num_eigenvectors,
         lambda_sgl=dataset.lambda_sgl,
+        sogs_chunk_size=dataset.sogs_chunk_size,
     )
     scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
     gaussians.training_setup(opt)
@@ -491,6 +492,7 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
             use_second_order=dataset.use_second_order,
             num_eigenvectors=dataset.num_eigenvectors,
             lambda_sgl=dataset.lambda_sgl,
+            sogs_chunk_size=dataset.sogs_chunk_size,
         )
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         gaussians.eval()

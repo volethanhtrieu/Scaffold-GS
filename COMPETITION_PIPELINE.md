@@ -41,7 +41,8 @@ opt-in competition command such as:
 ```bash
 python train_competition.py --gpu 0 \
   --use-second-order True --feat-dim 16 \
-  --num-eigenvectors 2 --lambda-sgl 0.01 --dry-run
+  --num-eigenvectors 2 --lambda-sgl 0.01 \
+  --sogs-chunk-size 2048 --dry-run
 ```
 
 Keep the generated `cfg_args`, `sogs_config.json`, checkpoint, and training
