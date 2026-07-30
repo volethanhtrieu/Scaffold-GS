@@ -501,8 +501,15 @@ class SelectiveGradientLossTests(unittest.TestCase):
         expected_y = torch.nn.functional.conv2d(
             image, reference_y, padding=1, groups=3
         )
-        self.assertTrue(torch.equal(fused_x, expected_x))
-        self.assertTrue(torch.equal(fused_y, expected_y))
+        # COMPATIBILITY: older PyTorch convolution backends may accumulate a
+        # grouped convolution in a different order than separate x/y calls.
+        # The two paths must agree numerically, but need not be bit-identical.
+        self.assertTrue(
+            torch.allclose(fused_x, expected_x, rtol=1e-5, atol=1e-6)
+        )
+        self.assertTrue(
+            torch.allclose(fused_y, expected_y, rtol=1e-5, atol=1e-6)
+        )
 
     def test_shape_and_nonfinite_validation(self):
         with self.assertRaisesRegex(ValueError, "identical shapes"):

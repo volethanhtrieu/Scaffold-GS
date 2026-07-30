@@ -159,6 +159,7 @@ TF32/fused Adam; both are isolated to explicit profile settings.
 | Parser smoke test (`True`, `False`, `--use_second_order`) | Passed | Safe explicit and bare-flag forms |
 | `python test_sogs.py` | Passed (53; 33 skipped) | Base environment has no PyTorch; parser/static/runtime-profile and non-mutating launcher tests ran |
 | `conda run -n depth_anything python test_sogs.py` | Passed (53 tests) | CPU PyTorch 2.12.1+cu130; includes launcher non-mutation, retained/checkpointed gradient equivalence, cache invalidation, optimizer/config/checkpoint round trips, and cached loss kernels |
+| Grouped Sobel numerical-equivalence regression | Passed | Uses float32 tolerance because PyTorch 1.12 may accumulate grouped and separate convolutions in a different order; the loss implementation is unchanged |
 | PyTorch 2.12 runtime-policy probe | Passed | Explicit `fp32_precision` API resolved to `tf32`/`ieee` as requested without mixing legacy controls |
 | Adam `auto` construction probe | Passed | CPU fallback resolved to `foreach`; A100 fused execution remains unmeasured |
 | 30-step zero-initialized SOGS optimizer probe | Passed | Features and gradients remained finite for every synthetic step |
