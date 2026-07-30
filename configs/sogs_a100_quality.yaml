@@ -1,0 +1,27 @@
+# A100-SXM4-80GB quality-first SOGS candidate.
+# INFERENCE: D=32 follows the paper's increasing-quality trend, but has not
+# been validated on the Viettel scenes and is not guaranteed to rank best.
+method: sogs_a100_quality
+use_second_order: true
+feat_dim: 32
+num_eigenvectors: 2
+lambda_sgl: 0.01
+n_offsets: 10
+appearance_dim: 0
+resolution: 1
+iterations: 30000
+
+# Retain activations and cache frozen multi-view render features on the 80-GB
+# card, while keeping full numerical checks for this control candidate.
+sogs_chunk_size: 65536
+sogs_checkpointing: false
+sogs_validate_numerics: true
+sogs_cache_render_features: true
+densification_chunk_size: 8192
+
+# Full IEEE float32 and the legacy optimizer provide the quality control.
+tf32_mode: disabled
+cudnn_benchmark: true
+optimizer_backend: default
+log_interval: 50
+disable_gui: true

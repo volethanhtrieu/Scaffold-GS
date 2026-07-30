@@ -1,0 +1,24 @@
+# One-hour, single-scene SOGS ablation for a 24-GiB GPU.
+# INFERENCE: these values prioritize a bounded runtime over final quality and
+# are not paper defaults or claimed competition-optimal settings.
+method: sogs_one_hour
+use_second_order: true
+feat_dim: 12
+num_eigenvectors: 1
+lambda_sgl: 0.0
+sogs_chunk_size: 4096
+sogs_checkpointing: true
+sogs_validate_numerics: true
+sogs_cache_render_features: false
+densification_chunk_size: 1024
+n_offsets: 5
+voxel_size: 0.002
+ratio: 4
+iterations: 3000
+start_stat: 100
+update_from: 500
+update_interval: 100
+update_until: 2500
+checkpoint_interval: 500
+# Reserve five minutes for final PLY/MLP/checkpoint serialization.
+max_runtime_minutes: 55

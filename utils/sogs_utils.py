@@ -18,7 +18,7 @@ from typing import NamedTuple, Optional, Tuple
 
 import torch
 from torch import nn
-from torch.utils.checkpoint import checkpoint
+from utils.checkpoint_utils import activation_checkpoint
 
 
 class SecondOrderStatistics(NamedTuple):
@@ -68,6 +68,7 @@ def compute_second_order_statistics(
     num_eigenvectors: int,
     *,
     eps: float = 1e-6,
+    validate_finite: bool = True,
 ) -> SecondOrderStatistics:
     """Compute correlation statistics and the top principal co-variations.
 
@@ -81,6 +82,10 @@ def compute_second_order_statistics(
         standalone function and returns an empty ``[D, 0]`` selection.
     eps:
         Positive floor used when normalizing zero-variance channels.
+    validate_finite:
+        Check the complete input for NaN/Inf.  This defaults to ``True`` for
+        standalone safety; a validated performance profile may disable the
+        reduction to avoid a host synchronization on every training view.
 
     Returns
     -------
@@ -105,7 +110,9 @@ def compute_second_order_statistics(
         )
     if not anchor_features.is_floating_point():
         raise ValueError("anchor_features must use a floating-point dtype")
-    if not torch.isfinite(anchor_features).all().item():
+    if not isinstance(validate_finite, bool):
+        raise ValueError("validate_finite must be a boolean")
+    if validate_finite and not torch.isfinite(anchor_features).all().item():
         raise ValueError("anchor_features contains NaN or infinite values")
     if not isinstance(num_eigenvectors, int) or isinstance(
         num_eigenvectors, bool
@@ -195,14 +202,12 @@ def compute_second_order_statistics(
     eigenvalues, eigenvectors = torch.linalg.eigh(eig_matrix)
     order = torch.argsort(eigenvalues, descending=True)
     order = order[:num_eigenvectors]
-    # Keep the reported eigenvalues tied to the unperturbed correlation
-    # matrix.  The infinitesimal tie-breaker is only an INFERENCE-time
-    # numerical aid for selecting a stable basis in degenerate eigenspaces.
-    reference_eigenvalues = torch.linalg.eigvalsh(correlation)
-    reference_eigenvalues = torch.sort(
-        reference_eigenvalues, descending=True
-    ).values
-    selected_values = reference_eigenvalues[:num_eigenvectors].clamp_min(0.0)
+    # INFERENCE: the branch construction consumes only the eigenvectors.  Keep
+    # the values returned by this same symmetric solve instead of launching a
+    # second ``eigvalsh`` over the unperturbed matrix on every render pass.
+    # The diagonal perturbation is at the numerical epsilon scale and does not
+    # alter the selected directions in non-degenerate scenes.
+    selected_values = eigenvalues.index_select(0, order).clamp_min(0.0)
     selected_vectors = eigenvectors.index_select(1, order)
     selected_vectors = torch.nan_to_num(
         selected_vectors, nan=0.0, posinf=0.0, neginf=0.0
@@ -233,6 +238,8 @@ class SecondOrderFeatureAugmentor(nn.Module):
         *,
         hidden_dim: Optional[int] = None,
         chunk_size: int = 2048,
+        checkpointing: bool = True,
+        validate_numerics: bool = True,
     ) -> None:
         super().__init__()
         validate_second_order_dimensions(
@@ -247,11 +254,17 @@ class SecondOrderFeatureAugmentor(nn.Module):
             raise ValueError("chunk_size must be a positive integer")
         if chunk_size <= 0:
             raise ValueError("chunk_size must be a positive integer")
+        if not isinstance(checkpointing, bool):
+            raise ValueError("checkpointing must be a boolean")
+        if not isinstance(validate_numerics, bool):
+            raise ValueError("validate_numerics must be a boolean")
         # PAPER: each Fi is a two-layer MLP with ReLU activation.  The paper
         # does not prescribe a hidden width; using D preserves local MLP scale.
         # INFERENCE: chunked checkpointing bounds feature-branch activation
         # memory for large anchor sets while preserving the differentiable path.
         self.chunk_size = chunk_size
+        self.checkpointing = checkpointing
+        self.validate_numerics = validate_numerics
         self.branches = nn.ModuleList(
             [
                 nn.Sequential(
@@ -321,7 +334,10 @@ class SecondOrderFeatureAugmentor(nn.Module):
                 raise ValueError("output_mask and anchor_features must share a device")
         if not anchor_features.is_floating_point():
             raise ValueError("anchor_features must use a floating-point dtype")
-        if not torch.isfinite(anchor_features).all().item():
+        if (
+            self.validate_numerics
+            and not torch.isfinite(anchor_features).all().item()
+        ):
             raise ValueError("anchor_features contains NaN or infinite values")
         if self.num_eigenvectors == 0:
             return anchor_features
@@ -335,27 +351,38 @@ class SecondOrderFeatureAugmentor(nn.Module):
         # PAPER: statistics are computed from all scene anchors, even when
         # only visible anchors are requested by the renderer.
         statistics = compute_second_order_statistics(
-            anchor_features, self.num_eigenvectors
+            anchor_features,
+            self.num_eigenvectors,
+            validate_finite=False,
         )
         eigenvectors = statistics.eigenvectors
         chunks = []
         for start in range(0, selected_features.shape[0], self.chunk_size):
             chunk = selected_features[start : start + self.chunk_size]
-            if self.training and chunk.requires_grad:
+            if self.checkpointing and self.training and chunk.requires_grad:
                 # INFERENCE: recompute branch activations during backward to
                 # bound peak VRAM. PyTorch's default reentrant checkpoint is
-                # available in the repository's legacy torch 1.12 runtime.
-                augmented_chunk = checkpoint(
+                # available in the legacy torch 1.12 runtime.
+                augmented_chunk = activation_checkpoint(
                     self._augment_chunk, chunk, eigenvectors
                 )
             else:
-                augmented_chunk = self._augment_chunk(chunk, eigenvectors)
+                # INFERENCE: retained-activation A100 profiles still honor the
+                # chunk limit; a large limit makes ordinary scenes one call,
+                # while unusually large scenes avoid an unbounded allocation.
+                augmented_chunk = self._augment_chunk(
+                    chunk, eigenvectors
+                )
             chunks.append(augmented_chunk)
-
-        augmented_features = torch.cat(chunks, dim=0)
+        augmented_features = (
+            chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
+        )
         expected_dim = self.feat_dim * (1 + self.num_eigenvectors)
         assert augmented_features.shape[-1] == expected_dim
-        if not torch.isfinite(augmented_features).all().item():
+        if (
+            self.validate_numerics
+            and not torch.isfinite(augmented_features).all().item()
+        ):
             raise ValueError(
                 "second-order feature augmentation produced NaN or infinite values"
             )

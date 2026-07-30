@@ -241,11 +241,16 @@ def render_scene(
     from scene.cameras import MiniCam
     from scene.colmap_loader import qvec2rotmat
     from utils.graphics_utils import focal2fov, getWorld2View2
+    from utils.runtime_utils import configure_torch_runtime
 
     cfg_path = model_dir / "cfg_args"
     if not cfg_path.is_file():
         raise FileNotFoundError(f"Missing training config: {cfg_path}")
     config = read_config_namespace(cfg_path)
+    configure_torch_runtime(
+        tf32_mode=str(config.get("tf32_mode", "default")),
+        cudnn_benchmark=str2bool(config.get("cudnn_benchmark", False)),
+    )
     selected_iteration, iteration_dir = find_iteration(model_dir, iteration)
 
     model = GaussianModel(
@@ -265,6 +270,15 @@ def render_scene(
         num_eigenvectors=int(config.get("num_eigenvectors", 2)),
         lambda_sgl=float(config.get("lambda_sgl", 0.01)),
         sogs_chunk_size=int(config.get("sogs_chunk_size", 2048)),
+        sogs_checkpointing=str2bool(
+            config.get("sogs_checkpointing", True)
+        ),
+        sogs_validate_numerics=str2bool(
+            config.get("sogs_validate_numerics", True)
+        ),
+        sogs_cache_render_features=str2bool(
+            config.get("sogs_cache_render_features", False)
+        ),
     )
     model.load_ply_sparse_gaussian(str(iteration_dir / "point_cloud.ply"))
     model.load_mlp_checkpoints(str(iteration_dir))

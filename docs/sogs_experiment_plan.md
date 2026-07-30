@@ -94,3 +94,46 @@ Do not select a final configuration from paper claims alone. Inspect actual
 quality, peak memory, runtime, checkpoint size, scene resolution, and the
 competition's reproducibility requirements first; retain source, configs,
 dependency versions, checkpoints, and training logs for every candidate.
+
+## A100 selection protocol
+
+The A100-SXM4-80GB removes the 24-GiB memory constraint, but it does not make a
+single profile simultaneously fastest and highest-scoring. Use two stages once
+training is explicitly authorized:
+
+1. Run a short throughput-only probe on one public scene with identical model
+   settings, changing only checkpointing/chunking, TF32, and Adam backend.
+   Record iterations/second and peak allocated/reserved memory. Do not use this
+   short run to choose image quality.
+2. Run full controlled candidates A--D plus the two A100 candidates below on a
+   fixed organizer-provided validation split. Select by the official aggregate
+   score, using runtime only as a tie-breaker or deadline constraint.
+
+Prepared A100 commands:
+
+```bash
+DRY_RUN=1 scripts/train_sogs_a100.sh throughput \
+  "$SCENE_PATH" "$RUN_ROOT/E_a100_throughput"
+
+DRY_RUN=1 scripts/train_sogs_a100.sh quality \
+  "$SCENE_PATH" "$RUN_ROOT/F_a100_quality"
+```
+
+Remove `DRY_RUN=1` only for an authorized run. Candidate E uses `D=16`, TF32,
+automatic fused/foreach Adam, retained activations, and reduced finite/logging
+synchronization. Candidate F uses `D=32`, IEEE FP32, the original Adam backend,
+retained activations, and finite checks. Both retain full resolution, `M=2`,
+ten offsets, SGL weight 0.01, and 30,000 iterations.
+
+For a fair runtime ablation of E, compare these one at a time while keeping
+`D=16` fixed:
+
+- checkpointing on versus off;
+- `tf32_mode=disabled` versus `enabled`;
+- `optimizer_backend=default` versus `auto`;
+- finite checks on versus off.
+
+The requested/resolved runtime, PyTorch/CUDA versions, GPU model/capability, and
+memory controls are written to `runtime_config.json`; the complete CLI
+Namespace is written to `cfg_args`. Preserve both beside the checkpoint and
+training log.

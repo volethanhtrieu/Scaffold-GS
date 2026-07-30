@@ -135,20 +135,70 @@ python train.py -s <scene> -m <output> \
 `use_second_order` accepts explicit `True` and `False` values safely.
 `feat_dim` must be positive, `num_eigenvectors` must be between 1 and
 `feat_dim` when SOGS is enabled, and `lambda_sgl` must be non-negative.
-`sogs_chunk_size` controls SOGS, renderer-MLP, and densification tiling; use
-`1024` when a 24-GiB GPU still reaches out-of-memory (smaller values trade
-speed for VRAM).
+`sogs_chunk_size` controls SOGS and renderer-MLP activation tiling;
+`densification_chunk_size` independently controls the much wider
+duplicate-check temporary. Use smaller values when a 24-GiB GPU reaches
+out-of-memory (smaller values trade speed for VRAM).
 The competition launcher also accepts `--n-offsets 5` as a compact renderer
 profile when the offset tensors are the remaining memory bottleneck.
-The saved `cfg_args` and per-iteration `sogs_config.json` record these settings;
-rendering rejects architecture-incompatible checkpoints rather than silently
-initializing missing modules.
+The saved `cfg_args`, `runtime_config.json`, and per-iteration
+`sogs_config.json` record the requested/resolved settings; rendering rejects
+architecture-incompatible checkpoints rather than silently initializing
+missing modules.
 
 Reference profiles are documented in `configs/`, and opt-in launchers are in
 `scripts/`. The YAML files document command profiles; the repository continues
 to use command-line arguments and `cfg_args` rather than loading YAML directly.
 SOGS defaults come from the paper and are not claimed to be optimal for the
 Viettel AI Race scenes.
+
+For a bounded, from-scratch single-scene run on a 24-GiB GPU, the compact
+one-hour ablation saves periodic checkpoints and stops safely before its
+wall-clock limit:
+
+```bash
+scripts/train_sogs_one_hour.sh \
+  data/HCM0421/train \
+  outputs/one_hour/HCM0421
+```
+
+This profile disables selective gradient loss and reduces model capacity; it
+is a fast fallback, not the paper-default or competition-optimal configuration.
+
+For the reported A100-SXM4-80GB, two explicit candidates retain activations
+instead of checkpoint-recomputing them:
+
+```bash
+# Print either command without training.
+DRY_RUN=1 scripts/train_sogs_a100.sh throughput \
+  data/HCM0421/train outputs/a100_throughput/HCM0421
+DRY_RUN=1 scripts/train_sogs_a100.sh quality \
+  data/HCM0421/train outputs/a100_quality/HCM0421
+```
+
+For the fastest prepared full-resolution run across all seven competition
+scenes, use the dedicated one-command launcher. It verifies the environment,
+requires an idle A100, and trains the scenes sequentially:
+
+```bash
+# Preview only; no GPU work or output creation.
+scripts/run_sogs_a100_max_speed.sh --dry-run
+
+# Starts seven 30,000-iteration training runs.
+scripts/run_sogs_a100_max_speed.sh
+```
+
+The launcher never kills a GPU process and never overwrites a non-empty model
+directory. Logs are written outside the model directories under
+`logs/a100_max_speed/`.
+
+The throughput candidate uses paper-size `D=16`, opt-in TF32, and the fastest
+Adam backend supported by the installed PyTorch. The quality-control candidate
+uses `D=32`, explicit IEEE FP32, and the original Adam construction. Both keep
+full image resolution, ten offsets, `M=2`, SGL, a pose-safe zero-dimensional
+appearance embedding, and 30,000 iterations. Neither is claimed
+competition-optimal until controlled PSNR/SSIM/LPIPS measurements are run on
+the actual A100.
 
 For a complete command-by-command walkthrough, see
 [`docs/sogs_run_guide.md`](docs/sogs_run_guide.md).

@@ -2,11 +2,15 @@
 
 ## Repository Baseline
 
-- Branch: `main` (the recommended `feature/sogs-integration` branch could not be
-  created because `.git` is read-only in this environment)
-- Commit: `9718569d385c618f551242402a26a7db34259c56`
-- Dirty files: migration files listed below; no user changes were present at
-  baseline
+- Branch: `feature/sogs-integration`
+- Commit before the A100 pass:
+  `ddef7063f56201e1b4b046d504845c4f31ea382a`
+- Dirty files before the A100 pass: `README.md`, `docs/sogs_run_guide.md`,
+  `docs/sogs_verification_report.md`, `test_sogs.py`, `train.py`, and
+  `train_competition.py`; untracked `configs/sogs_one_hour.yaml`,
+  `scripts/train_sogs_one_hour.sh`, and `utils/training_budget.py`
+- Safety: all pre-existing changes were retained; no reset, stash, checkout,
+  commit, or submodule modification was performed
 
 ### NVRTC compatibility follow-up (2026-07-30)
 
@@ -42,7 +46,8 @@
   largest per-anchor tensors. Densification statistics now map selected offsets
   directly instead of allocating and cloning scene-wide boolean masks, while
   duplicate checks reduce each chunk in-place instead of retaining every
-  intermediate mask.
+  intermediate mask. The later A100 pass separates their tile size into
+  `densification_chunk_size`.
 - Runtime guidance: start with `--sogs-chunk-size 2048`; use `1024` if the
   first setting still reaches CUDA out-of-memory. This is a memory/performance
   control and does not change the augmented feature dimension.
@@ -53,6 +58,31 @@ Current working-tree follow-up baseline:
 - Commit before these VRAM edits: `707931c8` (zero-variance fix)
 - Training: not executed
 
+### A100-SXM4-80GB follow-up (2026-07-30)
+
+- Target: the user reported one SM80 A100 with 80 GiB. The snapshot showed
+  about 2.4 GiB allocated and 87% utilization by an existing process.
+- Local limitation: this workspace exposes neither `nvidia-smi` nor a CUDA
+  device, so A100 throughput, memory, rasterizer behavior, and image quality
+  were not measured here.
+- Resolution: add opt-in retained-activation, finite-check, frozen-render-cache,
+  TF32, cuDNN autotuner, Adam-backend, densification-chunk, GUI, and logging
+  controls. Reuse the existing symmetric `eigh` result instead of running a
+  second eigenvalue-only solve, and fuse the four SGL Sobel launches into one
+  value-equivalent grouped convolution. Keep all baseline defaults compatible.
+- Profiles: add separate throughput (`D=16`, TF32/auto Adam) and
+  quality-control (`D=32`, IEEE FP32/default Adam) launchers. Both retain full
+  resolution, ten offsets, no unknown test-pose appearance embedding, `M=2`,
+  SGL weight 0.01, and 30,000 iterations.
+- Full-speed runner: add one wrapper for all seven scenes that performs the
+  strict verifier, rejects competing compute PIDs, waits out small transient
+  utilization, preserves fresh-output guards, runs scenes sequentially, and
+  stores console logs outside model directories. It never kills a process or
+  changes GPU clocks/power limits.
+- Reproducibility: CLI training records the complete Namespace in `cfg_args`
+  and writes the resolved PyTorch/CUDA/GPU/optimizer/runtime values to
+  `runtime_config.json`.
+
 ## Files Modified
 
 | File | Reason | Main risk |
@@ -62,7 +92,9 @@ Current working-tree follow-up baseline:
 | `scene/sogs.py` | Compatibility re-export | None beyond import-time dependency behavior |
 | `scene/gaussian_model.py` | Feature accessor, MLP dimensions, optimizer, checkpoint/metadata state | Architecture/checkpoint compatibility |
 | `gaussian_renderer/__init__.py` | Single augmented-feature path and dimension assertions | Renderer input shape/per-view overhead |
-| `utils/loss_utils.py` | Isolated selective gradient loss | Sobel border/reduction conventions |
+| `utils/loss_utils.py` | Isolated selective gradient loss, cached windows, and value-equivalent grouped Sobel evaluation | Sobel border/reduction conventions |
+| `utils/runtime_utils.py` | Explicit TF32/cuDNN runtime policy | Floating-point policy can change metrics |
+| `utils/checkpoint_utils.py` | Preserve checkpoint behavior across legacy/current PyTorch | Version-specific checkpoint semantics |
 | `train.py` | Opt-in SGL term and component logging | Training-only numerical/quality behavior |
 | `render.py` | Reuse saved SOGS settings and safer device probing | Inference environment differences |
 | `render_test_poses.py` | Reuse SOGS settings from `cfg_args` | Competition checkpoint compatibility |
@@ -99,6 +131,21 @@ these two reports. Its dedicated regression test starts with an all-zero
 through the eigendecomposition path, and requires finite feature and MLP
 gradients.
 
+The one-hour follow-up adds `utils/training_budget.py`, bounded-run arguments
+in `train.py` and `train_competition.py`, the compact
+`scripts/train_sogs_one_hour.sh` launcher, and
+`configs/sogs_one_hour.yaml`. On deadline, the loop saves both renderable model
+files and a structured optimizer checkpoint. This behavior is an operational
+inference for time-constrained runs, not part of the SOGS paper.
+
+The A100 follow-up modifies the core/configuration/renderer/loss files above,
+adds `utils/runtime_utils.py`, `utils/checkpoint_utils.py`,
+`configs/sogs_a100_throughput.yaml`, `configs/sogs_a100_quality.yaml`, and
+`scripts/train_sogs_a100.sh`, later adds
+`scripts/run_sogs_a100_max_speed.sh`, and updates the reports/run guide. Its
+main risks are unmeasured A100 peak memory and possible score changes from
+TF32/fused Adam; both are isolated to explicit profile settings.
+
 ## Static Checks
 
 | Check | Result | Notes |
@@ -110,12 +157,20 @@ gradients.
 | `bash -n` on modified launcher scripts | Passed | No launcher was executed |
 | `git diff --check` | Passed | No whitespace errors in the migration diff |
 | Parser smoke test (`True`, `False`, `--use_second_order`) | Passed | Safe explicit and bare-flag forms |
-| `python test_sogs.py` | Passed (37; 28 skipped) | Base environment has no PyTorch; parser/static tests ran |
-| `conda run -n depth_anything python test_sogs.py` | Passed (37 tests) | CPU PyTorch; includes visible-row augmentation, chunked renderer forward/backward, memory-efficient statistics indexing, checkpoint gradients, and chunk-size validation |
+| `python test_sogs.py` | Passed (53; 33 skipped) | Base environment has no PyTorch; parser/static/runtime-profile and non-mutating launcher tests ran |
+| `conda run -n depth_anything python test_sogs.py` | Passed (53 tests) | CPU PyTorch 2.12.1+cu130; includes launcher non-mutation, retained/checkpointed gradient equivalence, cache invalidation, optimizer/config/checkpoint round trips, and cached loss kernels |
+| PyTorch 2.12 runtime-policy probe | Passed | Explicit `fp32_precision` API resolved to `tf32`/`ieee` as requested without mixing legacy controls |
+| Adam `auto` construction probe | Passed | CPU fallback resolved to `foreach`; A100 fused execution remains unmeasured |
 | 30-step zero-initialized SOGS optimizer probe | Passed | Features and gradients remained finite for every synthetic step |
 | `python -m py_compile train.py render.py scene/gaussian_model.py utils/sogs_utils.py utils/loss_utils.py test_sogs.py` | Passed | NVRTC and zero-variance compatibility follow-ups |
 | `bash -n scripts/verify_sogs_environment.sh` | Passed | CUDA preflight script syntax only |
-| `python train_competition.py --help` | Passed | Exposes `--sogs-chunk-size` and `--n-offsets` without starting training |
+| `python train_competition.py --help` | Passed | Exposes memory, runtime-budget, and checkpoint-interval controls without starting training |
+| `bash -n scripts/train_sogs_one_hour.sh` | Passed | The bounded launcher was not executed |
+| `bash -n scripts/train_sogs_a100.sh` | Passed | Launcher syntax only |
+| A100 throughput/quality launcher with `DRY_RUN=1` | Passed | Both resolved commands printed; no output directory or training was created |
+| `scripts/run_sogs_a100_max_speed.sh --dry-run` | Passed | Resolved all seven full-speed commands; GPU checks, output/log creation, and training remained disabled |
+| Max-speed synthetic one-scene dry-run test | Passed | Verified TF32/no-eval/logging flags and confirmed no output or log directory was created |
+| One-scene A100 `train_competition.py --dry-run` | Passed | HCM0421 validated (240 train images, 60 poses); all new flags propagated and no training started |
 | Seven-scene `train_competition.py --dry-run` with chunk size 2048 | Passed | Validated all scenes, propagated the memory setting, and created no output directory |
 | `bash -n train.sh single_train.sh scripts/train_sogs.sh` | Passed | Chunk-size propagation syntax only |
 | CUDA volume/SOGS-backward preflight | Not run here | This workspace has no NVIDIA runtime; run the verifier on the primary GPU |
@@ -132,6 +187,7 @@ gradients.
 | Selected eigenvectors | Not used | `D x M` | Yes (synthetic CPU tensors) |
 | Each learned branch | Not used | `N x D` | Yes |
 | Render feature | `N x D` | `N x D*(1+M)` | Yes |
+| Cached eval feature | Not needed | `N x D*(1+M)` only in no-grad eval | Yes (synthetic CPU cache/invalidation test) |
 | Opacity input (no distance) | `N x (D+3)` | `N x (D*(1+M)+3)` | Yes |
 | Covariance input (no distance) | `N x (D+3)` | `N x (D*(1+M)+3)` | Yes |
 | Color input (no distance/appearance) | `N x (D+3)` | `N x (D*(1+M)+3)` | Yes |
@@ -150,6 +206,9 @@ gradients.
   unexpected, or incompatible state.
 - New PLY files continue to store base `N x D` features; augmented features are
   recomputed from the saved configuration.
+- Runtime-only SOGS controls are recorded but may change at load time because
+  they do not alter learned tensor shapes; architecture and SGL settings remain
+  strict.
 
 ## Training Status
 
@@ -169,5 +228,14 @@ Training was not executed in this environment.
   assumption in the migration plan.
 - Full differentiable rasterizer, competition-resolution rendering, and
   organizer submission validation were not run.
+- Retained activations, an 8,192-row densification tile, fused/foreach Adam,
+  and the full eval feature cache have not been profiled on the reported A100;
+  lower the independent chunk controls if the measured peak is unsafe.
+- TF32 and fused/foreach Adam can change floating-point ordering. The
+  throughput profile must be scored against the IEEE-FP32 quality control
+  before it is used for a submission.
+- The compact one-hour profile has not been benchmarked on the primary RTX
+  4090; its wall-clock stop is deterministic, but completed iterations and
+  resulting quality remain scene-dependent.
 - No PSNR, SSIM, LPIPS, memory, FPS, model-size, or competition-score claim is
   made without authorized experiments.

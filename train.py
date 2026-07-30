@@ -89,11 +89,23 @@ from utils.loss_utils import (
 from gaussian_renderer import prefilter_voxel, render, network_gui
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
+from utils.training_budget import (
+    TrainingBudget,
+    should_checkpoint_iteration,
+    validate_checkpoint_interval,
+    validate_max_runtime_minutes,
+)
+from utils.runtime_utils import configure_torch_runtime
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
-from arguments import ModelParams, PipelineParams, OptimizationParams
+from arguments import (
+    ModelParams,
+    OptimizationParams,
+    PipelineParams,
+    validate_positive_int,
+)
 
 # torch.set_num_threads(32)
 # COMPATIBILITY: avoid constructing a GPU LPIPS model during --help/import.
@@ -132,9 +144,58 @@ def saveRuntimeCode(dst: str) -> None:
     print('Backup Finished!')
 
 
-def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None):
+def _save_training_checkpoint(gaussians, iteration, model_path, logger):
+    checkpoint_path = os.path.join(model_path, f"chkpnt{iteration}.pth")
+    logger.info("\n[ITER {}] Saving Checkpoint".format(iteration))
+    torch.save((gaussians.capture(), iteration), checkpoint_path)
+    return checkpoint_path
+
+
+def _log_cuda_peak_memory(device, logger):
+    """Record allocator peaks without forcing a CUDA synchronization."""
+
+    if logger is None or not torch.cuda.is_available():
+        return
+    logger.info(
+        "CUDA peak memory: allocated={} MiB, reserved={} MiB".format(
+            torch.cuda.max_memory_allocated(device) // (1024 * 1024),
+            torch.cuda.max_memory_reserved(device) // (1024 * 1024),
+        )
+    )
+
+
+def training(
+    dataset,
+    opt,
+    pipe,
+    dataset_name,
+    testing_iterations,
+    saving_iterations,
+    checkpoint_iterations,
+    checkpoint,
+    debug_from,
+    wandb=None,
+    logger=None,
+    ply_path=None,
+    runtime_budget=None,
+    checkpoint_interval=0,
+    log_interval=1,
+    enable_gui=True,
+    config_snapshot=None,
+):
     first_iter = 0
-    tb_writer = prepare_output_and_logger(dataset)
+    if runtime_budget is None:
+        runtime_budget = TrainingBudget()
+    checkpoint_interval = validate_checkpoint_interval(checkpoint_interval)
+    log_interval = validate_positive_int(
+        log_interval,
+        name="log_interval",
+    )
+    # COMPATIBILITY: direct callers may still provide only ModelParams. The
+    # CLI path records the complete resolved Namespace for reproducibility.
+    tb_writer = prepare_output_and_logger(
+        dataset if config_snapshot is None else config_snapshot
+    )
     gaussians = GaussianModel(
         feat_dim=dataset.feat_dim,
         n_offsets=dataset.n_offsets,
@@ -152,25 +213,87 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         num_eigenvectors=dataset.num_eigenvectors,
         lambda_sgl=dataset.lambda_sgl,
         sogs_chunk_size=dataset.sogs_chunk_size,
+        sogs_checkpointing=dataset.sogs_checkpointing,
+        sogs_validate_numerics=dataset.sogs_validate_numerics,
+        sogs_cache_render_features=dataset.sogs_cache_render_features,
     )
     scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
     gaussians.training_setup(opt)
+    resolved_torch_runtime = configure_torch_runtime(
+        tf32_mode=getattr(dataset, "tf32_mode", "default"),
+        cudnn_benchmark=getattr(dataset, "cudnn_benchmark", False),
+    )
+    # COMPATIBILITY: persist the resolved optimizer/runtime implementation in
+    # addition to cfg_args, where optimizer_backend may still be "auto".
+    runtime_metadata = {
+        "torch_version": str(torch.__version__),
+        "torch_cuda_version": str(torch.version.cuda),
+        "requested_optimizer_backend": str(
+            getattr(opt, "optimizer_backend", "default")
+        ),
+        "resolved_optimizer_backend": str(gaussians.optimizer_backend),
+        "tf32_mode": str(getattr(dataset, "tf32_mode", "default")),
+        "cudnn_benchmark": bool(
+            getattr(dataset, "cudnn_benchmark", False)
+        ),
+        "resolved_torch_runtime": resolved_torch_runtime,
+        "sogs_checkpointing": bool(dataset.sogs_checkpointing),
+        "sogs_validate_numerics": bool(dataset.sogs_validate_numerics),
+        "sogs_cache_render_features": bool(
+            dataset.sogs_cache_render_features
+        ),
+        "sogs_chunk_size": int(dataset.sogs_chunk_size),
+        "densification_chunk_size": int(
+            gaussians.densification_chunk_size
+        ),
+    }
+    if torch.cuda.is_available():
+        device_properties = torch.cuda.get_device_properties(
+            gaussians.device
+        )
+        runtime_metadata["cuda_device"] = {
+            "name": device_properties.name,
+            "compute_capability": [
+                int(device_properties.major),
+                int(device_properties.minor),
+            ],
+            "total_memory_bytes": int(device_properties.total_memory),
+        }
+    with open(
+        os.path.join(scene.model_path, "runtime_config.json"),
+        "w",
+    ) as runtime_file:
+        json.dump(runtime_metadata, runtime_file, indent=2, sort_keys=True)
+    if logger is not None:
+        logger.info(f"resolved runtime: {runtime_metadata}")
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(gaussians.device)
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
+    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    # COMPATIBILITY: the background is constant for a run. Reusing it avoids
+    # one host allocation and host-to-device copy per iteration.
+    background = torch.tensor(
+        bg_color,
+        dtype=torch.float32,
+        device=gaussians.device,
+    )
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+    last_progress_iteration = first_iter - 1
+    progress_interval = max(10, log_interval)
     for iteration in range(first_iter, opt.iterations + 1):        
         # network gui not available in scaffold-gs yet
-        if network_gui.conn == None:
+        if enable_gui and network_gui.conn == None:
             network_gui.try_connect()
-        while network_gui.conn != None:
+        while enable_gui and network_gui.conn != None:
             try:
                 net_image_bytes = None
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
@@ -183,12 +306,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             except Exception as e:
                 network_gui.conn = None
 
-        iter_start.record()
+        log_scalars = (
+            iteration % log_interval == 0
+            or iteration == opt.iterations
+        )
+        measure_timing = bool(tb_writer is not None and log_scalars)
+        if measure_timing:
+            iter_start.record()
 
         gaussians.update_learning_rate(iteration)
-
-        bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
-        background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
         
         # Pick a random Camera
@@ -206,7 +332,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
 
-        gt_image = viewpoint_cam.original_image.cuda()
+        gt_image = viewpoint_cam.original_image.to(
+            device=image.device,
+            non_blocking=True,
+        )
         Ll1 = l1_loss(image, gt_image)
 
         ssim_loss = (1.0 - ssim(image, gt_image))
@@ -215,7 +344,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         # when SOGS is disabled or lambda_sgl is zero.
         sgl_loss = image.new_zeros(())
         if dataset.use_second_order and dataset.lambda_sgl > 0:
-            sgl_loss = selective_gradient_loss(image, gt_image)
+            sgl_loss = selective_gradient_loss(
+                image,
+                gt_image,
+                validate_finite=dataset.sogs_validate_numerics,
+            )
         loss = (
             (1.0 - opt.lambda_dssim) * Ll1
             + opt.lambda_dssim * ssim_loss
@@ -225,13 +358,18 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         loss.backward()
         
-        iter_end.record()
+        if measure_timing:
+            iter_end.record()
 
         with torch.no_grad():
             # Progress bar
-            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-
-            if iteration % 10 == 0:
+            if (
+                iteration % progress_interval == 0
+                or iteration == opt.iterations
+            ):
+                ema_loss_for_log = (
+                    0.4 * loss.item() + 0.6 * ema_loss_for_log
+                )
                 progress_bar.set_postfix(
                     {
                         "L1": f"{Ll1.item():.5f}",
@@ -241,11 +379,17 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         "Total": f"{ema_loss_for_log:.7f}",
                     }
                 )
-                progress_bar.update(10)
+                progress_bar.update(iteration - last_progress_iteration)
+                last_progress_iteration = iteration
             if iteration == opt.iterations:
                 progress_bar.close()
 
             # Log and save
+            elapsed = (
+                iter_start.elapsed_time(iter_end)
+                if measure_timing
+                else None
+            )
             training_report(
                 tb_writer,
                 dataset_name,
@@ -253,7 +397,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 Ll1,
                 loss,
                 l1_loss,
-                iter_start.elapsed_time(iter_end),
+                elapsed,
                 testing_iterations,
                 scene,
                 render,
@@ -263,8 +407,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 ssim_loss=ssim_loss,
                 scaling_reg=scaling_reg,
                 sgl_loss=sgl_loss,
+                log_scalars=log_scalars,
             )
-            if (iteration in saving_iterations):
+            model_saved = iteration in saving_iterations
+            if model_saved:
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
             
@@ -286,9 +432,42 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
-            if (iteration in checkpoint_iterations):
-                logger.info("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+            checkpoint_saved = should_checkpoint_iteration(
+                iteration,
+                checkpoint_iterations,
+                checkpoint_interval,
+            )
+            if checkpoint_saved:
+                _save_training_checkpoint(
+                    gaussians,
+                    iteration,
+                    scene.model_path,
+                    logger,
+                )
+
+            # INFERENCE: a wall-clock limit makes short competition runs
+            # predictable. Finish the current optimizer step, then save both
+            # renderable model files and a resumable optimizer checkpoint.
+            if runtime_budget.expired() and iteration < opt.iterations:
+                logger.info(
+                    "\n[ITER {}] Runtime budget reached; saving a recoverable "
+                    "model before stopping.".format(iteration)
+                )
+                if not model_saved:
+                    scene.save(iteration)
+                if not checkpoint_saved:
+                    _save_training_checkpoint(
+                        gaussians,
+                        iteration,
+                        scene.model_path,
+                        logger,
+                    )
+                _log_cuda_peak_memory(gaussians.device, logger)
+                progress_bar.close()
+                return iteration, True
+
+    _log_cuda_peak_memory(gaussians.device, logger)
+    return opt.iterations, False
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -330,6 +509,7 @@ def training_report(
     ssim_loss=None,
     scaling_reg=None,
     sgl_loss=None,
+    log_scalars=True,
 ):
     # COMPATIBILITY: retain the local Scaffold-GS positional interface while
     # accepting optional component tensors for SOGS logging.
@@ -339,7 +519,7 @@ def training_report(
         scaling_reg = loss.new_zeros(())
     if sgl_loss is None:
         sgl_loss = loss.new_zeros(())
-    if tb_writer:
+    if tb_writer and log_scalars:
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar(
             f'{dataset_name}/train_loss_patches/ssim_loss',
@@ -357,10 +537,11 @@ def training_report(
             iteration,
         )
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/total_loss', loss.item(), iteration)
-        tb_writer.add_scalar(f'{dataset_name}/iter_time', elapsed, iteration)
+        if elapsed is not None:
+            tb_writer.add_scalar(f'{dataset_name}/iter_time', elapsed, iteration)
 
 
-    if wandb is not None:
+    if wandb is not None and log_scalars:
         wandb.log(
             {
                 "train_l1_loss": Ll1,
@@ -493,6 +674,9 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
             num_eigenvectors=dataset.num_eigenvectors,
             lambda_sgl=dataset.lambda_sgl,
             sogs_chunk_size=dataset.sogs_chunk_size,
+            sogs_checkpointing=dataset.sogs_checkpointing,
+            sogs_validate_numerics=dataset.sogs_validate_numerics,
+            sogs_cache_render_features=dataset.sogs_cache_render_features,
         )
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         gaussians.eval()
@@ -648,6 +832,39 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument(
+        "--checkpoint_interval",
+        type=int,
+        default=0,
+        help=(
+            "Save a resumable checkpoint every N iterations; zero disables "
+            "periodic checkpoints."
+        ),
+    )
+    parser.add_argument(
+        "--max_runtime_minutes",
+        type=float,
+        default=0.0,
+        help=(
+            "Stop training after this wall-clock budget and save the model "
+            "plus a resumable checkpoint; zero disables the limit. "
+            "Post-processing time is not included."
+        ),
+    )
+    parser.add_argument(
+        "--log_interval",
+        type=int,
+        default=1,
+        help=(
+            "Write scalar logs every N iterations. Larger values reduce "
+            "CPU/GPU synchronization; the original behavior is 1."
+        ),
+    )
+    parser.add_argument(
+        "--disable_gui",
+        action="store_true",
+        help="Disable the per-iteration network GUI connection check.",
+    )
     parser.add_argument("--gpu", type=str, default = '-1')
     parser.add_argument(
         "--skip_postprocess",
@@ -655,6 +872,23 @@ if __name__ == "__main__":
         help="Skip the built-in held-out rendering and metrics pass after training.",
     )
     args = parser.parse_args(sys.argv[1:])
+    try:
+        args.max_runtime_minutes = validate_max_runtime_minutes(
+            args.max_runtime_minutes
+        )
+        args.checkpoint_interval = validate_checkpoint_interval(
+            args.checkpoint_interval
+        )
+        args.log_interval = validate_positive_int(
+            args.log_interval,
+            name="log_interval",
+        )
+        runtime_settings = configure_torch_runtime(
+            tf32_mode=args.tf32_mode,
+            cudnn_benchmark=args.cudnn_benchmark,
+        )
+    except ValueError as error:
+        parser.error(str(error))
     args.save_iterations.append(args.iterations)
 
     
@@ -667,6 +901,7 @@ if __name__ == "__main__":
 
 
     logger.info(f'args: {args}')
+    logger.info(f"torch runtime: {runtime_settings}")
 
     if args.gpu != '-1':
         os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
@@ -706,18 +941,74 @@ if __name__ == "__main__":
     safe_state(args.quiet)
 
     # Start GUI server, configure and run training
-    network_gui.init(args.ip, args.port)
+    if not args.disable_gui:
+        network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     
-    # training
-    training(lp.extract(args), op.extract(args), pp.extract(args), dataset,  args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, wandb, logger)
+    # INFERENCE: one budget instance is shared by both passes so --warmup
+    # cannot silently double a requested wall-clock limit.
+    runtime_budget = TrainingBudget(args.max_runtime_minutes)
+    completed_iteration, time_limited = training(
+        lp.extract(args),
+        op.extract(args),
+        pp.extract(args),
+        dataset,
+        args.test_iterations,
+        args.save_iterations,
+        args.checkpoint_iterations,
+        args.start_checkpoint,
+        args.debug_from,
+        wandb,
+        logger,
+        runtime_budget=runtime_budget,
+        checkpoint_interval=args.checkpoint_interval,
+        log_interval=args.log_interval,
+        enable_gui=not args.disable_gui,
+        config_snapshot=args,
+    )
     if args.warmup:
-        logger.info("\n Warmup finished! Reboot from last checkpoints")
-        new_ply_path = os.path.join(args.model_path, f'point_cloud/iteration_{args.iterations}', 'point_cloud.ply')
-        training(lp.extract(args), op.extract(args), pp.extract(args), dataset,  args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, wandb=wandb, logger=logger, ply_path=new_ply_path)
+        if time_limited or runtime_budget.expired():
+            time_limited = True
+            logger.info(
+                "\nSkipping the warmup pass because the runtime budget was "
+                "exhausted."
+            )
+        else:
+            logger.info("\n Warmup finished! Reboot from last checkpoints")
+            new_ply_path = os.path.join(
+                args.model_path,
+                f"point_cloud/iteration_{completed_iteration}",
+                "point_cloud.ply",
+            )
+            completed_iteration, time_limited = training(
+                lp.extract(args),
+                op.extract(args),
+                pp.extract(args),
+                dataset,
+                args.test_iterations,
+                args.save_iterations,
+                args.checkpoint_iterations,
+                args.start_checkpoint,
+                args.debug_from,
+                wandb=wandb,
+                logger=logger,
+                ply_path=new_ply_path,
+                runtime_budget=runtime_budget,
+                checkpoint_interval=args.checkpoint_interval,
+                log_interval=args.log_interval,
+                enable_gui=not args.disable_gui,
+                config_snapshot=args,
+            )
 
     # All done
-    logger.info("\nTraining complete.")
+    if time_limited:
+        logger.info(
+            "\nTime-budgeted training stopped safely at iteration {}.".format(
+                completed_iteration
+            )
+        )
+    else:
+        logger.info("\nTraining complete.")
 
     if not args.skip_postprocess:
         # rendering

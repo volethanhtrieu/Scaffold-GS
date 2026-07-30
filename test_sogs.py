@@ -9,6 +9,7 @@ skipped when the active Python environment does not have PyTorch installed.
 import io
 import importlib.util
 import math
+import subprocess
 import sys
 import tempfile
 import types
@@ -19,16 +20,27 @@ from types import SimpleNamespace
 
 from arguments import (
     ModelParams,
+    validate_optimizer_backend,
+    validate_positive_int,
     validate_sogs_chunk_size,
     validate_sogs_config,
+    validate_tf32_mode,
+)
+from utils.training_budget import (
+    TrainingBudget,
+    should_checkpoint_iteration,
+    validate_checkpoint_interval,
+    validate_max_runtime_minutes,
 )
 
 try:
     import torch
 
     from utils.loss_utils import (
+        _sobel_gradient_maps,
         scaling_volume_regularization,
         selective_gradient_loss,
+        ssim,
     )
     from utils.sogs_utils import (
         SecondOrderFeatureAugmentor,
@@ -160,6 +172,8 @@ def optimization_args():
         appearance_lr_final=0.0005,
         appearance_lr_delay_mult=0.01,
         appearance_lr_max_steps=10,
+        optimizer_backend="default",
+        densification_chunk_size=4096,
     )
 
 
@@ -217,6 +231,41 @@ class ConfigurationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "sogs_chunk_size"):
                     validate_sogs_chunk_size(invalid)
 
+    def test_a100_runtime_controls_parse_safely(self):
+        config = self.parse_model(
+            [
+                "--sogs_checkpointing",
+                "False",
+                "--sogs_validate_numerics",
+                "False",
+                "--sogs_cache_render_features",
+                "True",
+                "--tf32_mode",
+                "enabled",
+                "--cudnn_benchmark",
+                "True",
+            ]
+        )
+        self.assertFalse(config.sogs_checkpointing)
+        self.assertFalse(config.sogs_validate_numerics)
+        self.assertTrue(config.sogs_cache_render_features)
+        self.assertEqual(config.tf32_mode, "enabled")
+        self.assertTrue(config.cudnn_benchmark)
+
+    def test_runtime_setting_validation(self):
+        self.assertEqual(validate_tf32_mode("enabled"), "enabled")
+        self.assertEqual(validate_optimizer_backend("auto"), "auto")
+        self.assertEqual(
+            validate_positive_int("8192", name="densification_chunk_size"),
+            8192,
+        )
+        with self.assertRaisesRegex(ValueError, "tf32_mode"):
+            validate_tf32_mode("fastest")
+        with self.assertRaisesRegex(ValueError, "optimizer_backend"):
+            validate_optimizer_backend("magic")
+        with self.assertRaisesRegex(ValueError, "log_interval"):
+            validate_positive_int(0, name="log_interval")
+
 
 @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch is not installed")
 class SecondOrderShapeAndNumericalTests(unittest.TestCase):
@@ -246,6 +295,59 @@ class SecondOrderShapeAndNumericalTests(unittest.TestCase):
         for parameter in augmentor.parameters():
             self.assertIsNotNone(parameter.grad)
             self.assertTrue(torch.isfinite(parameter.grad).all().item())
+
+    def test_checkpointed_and_retained_paths_match(self):
+        torch.manual_seed(7)
+        checkpointed = SecondOrderFeatureAugmentor(
+            4,
+            2,
+            chunk_size=2,
+            checkpointing=True,
+        )
+        retained = SecondOrderFeatureAugmentor(
+            4,
+            2,
+            chunk_size=64,
+            checkpointing=False,
+        )
+        retained.load_state_dict(checkpointed.state_dict())
+        features_checkpointed = torch.randn(7, 4, requires_grad=True)
+        features_retained = (
+            features_checkpointed.detach().clone().requires_grad_(True)
+        )
+
+        output_checkpointed = checkpointed(features_checkpointed)
+        output_retained = retained(features_retained)
+        self.assertTrue(
+            torch.allclose(
+                output_checkpointed,
+                output_retained,
+                atol=1e-6,
+                rtol=1e-6,
+            )
+        )
+        output_checkpointed.square().mean().backward()
+        output_retained.square().mean().backward()
+        self.assertTrue(
+            torch.allclose(
+                features_checkpointed.grad,
+                features_retained.grad,
+                atol=1e-6,
+                rtol=1e-5,
+            )
+        )
+        for checkpointed_parameter, retained_parameter in zip(
+            checkpointed.parameters(),
+            retained.parameters(),
+        ):
+            self.assertTrue(
+                torch.allclose(
+                    checkpointed_parameter.grad,
+                    retained_parameter.grad,
+                    atol=1e-6,
+                    rtol=1e-5,
+                )
+            )
 
     def test_constant_features(self):
         features = torch.ones(4, 3, requires_grad=True)
@@ -333,6 +435,13 @@ class VolumeRegularizationCompatibilityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "K x 3"):
             scaling_volume_regularization(torch.ones(3))
 
+    def test_empty_scaling_is_finite_zero(self):
+        scaling = torch.empty(0, 3, requires_grad=True)
+        loss = scaling_volume_regularization(scaling)
+        self.assertEqual(loss.item(), 0.0)
+        loss.backward()
+        self.assertIsNotNone(scaling.grad)
+
 
 @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch is not installed")
 class SelectiveGradientLossTests(unittest.TestCase):
@@ -368,6 +477,33 @@ class SelectiveGradientLossTests(unittest.TestCase):
             selective_gradient_loss(prediction, target).item(), 0.0
         )
 
+    def test_cached_loss_kernels_preserve_values(self):
+        prediction = torch.rand(3, 12, 12)
+        target = torch.rand_like(prediction)
+        first_sgl = selective_gradient_loss(prediction, target)
+        second_sgl = selective_gradient_loss(prediction, target)
+        self.assertTrue(torch.equal(first_sgl, second_sgl))
+        first_ssim = ssim(prediction, target)
+        second_ssim = ssim(prediction, target)
+        self.assertTrue(torch.equal(first_ssim, second_ssim))
+
+        image = prediction.unsqueeze(0)
+        fused_x, fused_y = _sobel_gradient_maps(image)
+        reference_x = torch.tensor(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]
+        ).view(1, 1, 3, 3).expand(3, 1, 3, 3)
+        reference_y = torch.tensor(
+            [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]
+        ).view(1, 1, 3, 3).expand(3, 1, 3, 3)
+        expected_x = torch.nn.functional.conv2d(
+            image, reference_x, padding=1, groups=3
+        )
+        expected_y = torch.nn.functional.conv2d(
+            image, reference_y, padding=1, groups=3
+        )
+        self.assertTrue(torch.equal(fused_x, expected_x))
+        self.assertTrue(torch.equal(fused_y, expected_y))
+
     def test_shape_and_nonfinite_validation(self):
         with self.assertRaisesRegex(ValueError, "identical shapes"):
             selective_gradient_loss(
@@ -388,7 +524,15 @@ class SelectiveGradientLossTests(unittest.TestCase):
     "GaussianModel dependencies are not installed: " + str(MODEL_IMPORT_ERROR),
 )
 class ModelCompatibilityTests(unittest.TestCase):
-    def make_model(self, enabled, *, chunk_size=2048):
+    def make_model(
+        self,
+        enabled,
+        *,
+        chunk_size=2048,
+        checkpointing=True,
+        validate_numerics=True,
+        cache_render_features=False,
+    ):
         model = GaussianModel(
             feat_dim=4,
             n_offsets=2,
@@ -397,6 +541,9 @@ class ModelCompatibilityTests(unittest.TestCase):
             num_eigenvectors=2,
             lambda_sgl=0.01,
             sogs_chunk_size=chunk_size,
+            sogs_checkpointing=checkpointing,
+            sogs_validate_numerics=validate_numerics,
+            sogs_cache_render_features=cache_render_features,
             device="cpu",
         )
         model._anchor = torch.nn.Parameter(torch.randn(3, 3))
@@ -455,6 +602,44 @@ class ModelCompatibilityTests(unittest.TestCase):
         restored = self.make_model(True, chunk_size=2048)
         restored.restore(state, optimization_args())
         self.assertEqual(restored.sogs_chunk_size, 2048)
+
+    def test_runtime_memory_controls_can_change_when_loading_weights(self):
+        source = self.make_model(
+            True,
+            checkpointing=True,
+            validate_numerics=True,
+            cache_render_features=False,
+        )
+        state = source.capture()
+        restored = self.make_model(
+            True,
+            checkpointing=False,
+            validate_numerics=False,
+            cache_render_features=True,
+        )
+        restored.restore(state, optimization_args())
+        self.assertFalse(restored.sogs_checkpointing)
+        self.assertFalse(restored.sogs_validate_numerics)
+        self.assertTrue(restored.sogs_cache_render_features)
+
+    def test_eval_render_feature_cache_is_reused_and_invalidated(self):
+        model = self.make_model(
+            True,
+            checkpointing=False,
+            cache_render_features=True,
+        )
+        model.eval()
+        with torch.no_grad():
+            first = model.get_render_features()
+            second = model.get_render_features()
+            visible = model.get_render_features(
+                visible_mask=torch.tensor([True, False, True])
+            )
+        self.assertEqual(first.data_ptr(), second.data_ptr())
+        self.assertTrue(torch.equal(visible, first[[0, 2]]))
+        self.assertIsNotNone(model._render_features_cache)
+        model.train()
+        self.assertIsNone(model._render_features_cache)
 
     def test_memory_efficient_renderer_forward_and_backward(self):
         model = self.make_model(True, chunk_size=1)
@@ -535,6 +720,8 @@ class ModelCompatibilityTests(unittest.TestCase):
     def test_optimizer_contains_second_order_parameters(self):
         model = self.make_model(True)
         model.training_setup(optimization_args())
+        self.assertEqual(model.optimizer_backend, "default")
+        self.assertEqual(model.densification_chunk_size, 4096)
         groups = {group["name"]: group for group in model.optimizer.param_groups}
         self.assertIn("mlp_second_order", groups)
         expected = {id(parameter) for parameter in model.second_order_augmentor.parameters()}
@@ -603,6 +790,41 @@ class ModelCompatibilityTests(unittest.TestCase):
                 self.make_model(True).load_mlp_checkpoints(directory)
 
 
+class TrainingBudgetTests(unittest.TestCase):
+    def test_disabled_budget_never_expires(self):
+        budget = TrainingBudget(0)
+        self.assertFalse(budget.enabled)
+        self.assertFalse(budget.expired())
+        self.assertIsNone(budget.remaining_seconds())
+
+    def test_budget_expires_at_monotonic_deadline(self):
+        now = [100.0]
+        budget = TrainingBudget(1.0, clock=lambda: now[0])
+        self.assertTrue(budget.enabled)
+        self.assertEqual(budget.remaining_seconds(), 60.0)
+        now[0] = 159.5
+        self.assertFalse(budget.expired())
+        now[0] = 160.0
+        self.assertTrue(budget.expired())
+        self.assertEqual(budget.remaining_seconds(), 0.0)
+
+    def test_invalid_runtime_budgets_are_rejected(self):
+        for value in (-1, float("nan"), float("inf"), True, "bad"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    validate_max_runtime_minutes(value)
+
+    def test_periodic_and_explicit_checkpoint_selection(self):
+        self.assertEqual(validate_checkpoint_interval(500), 500)
+        self.assertTrue(should_checkpoint_iteration(500, [], 500))
+        self.assertTrue(should_checkpoint_iteration(75, [75], 0))
+        self.assertFalse(should_checkpoint_iteration(76, [75], 500))
+        for value in (-1, 1.5, True, "bad"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    validate_checkpoint_interval(value)
+
+
 class StaticIntegrationTests(unittest.TestCase):
     def test_renderer_uses_single_model_feature_accessor(self):
         root = Path(__file__).resolve().parent
@@ -625,9 +847,97 @@ class StaticIntegrationTests(unittest.TestCase):
         model = (root / "scene" / "gaussian_model.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn("min(1024, self.sogs_chunk_size)", model)
+        self.assertIn("chunk_size = self.densification_chunk_size", model)
         self.assertIn("remove_duplicates.logical_or_", model)
         self.assertNotIn("remove_duplicates_list", model)
+
+    def test_runtime_budget_saves_renderable_and_resumable_state(self):
+        root = Path(__file__).resolve().parent
+        training = (root / "train.py").read_text(encoding="utf-8")
+        self.assertIn("runtime_budget.expired()", training)
+        self.assertIn("scene.save(iteration)", training)
+        self.assertIn("_save_training_checkpoint(", training)
+
+    def test_training_records_resolved_runtime_and_peak_memory(self):
+        root = Path(__file__).resolve().parent
+        training = (root / "train.py").read_text(encoding="utf-8")
+        self.assertIn('"runtime_config.json"', training)
+        self.assertIn('"resolved_torch_runtime"', training)
+        self.assertIn("config_snapshot=args", training)
+        self.assertIn("torch.cuda.max_memory_allocated", training)
+
+    def test_one_hour_profile_preserves_full_image_resolution(self):
+        root = Path(__file__).resolve().parent
+        launcher = (
+            root / "scripts" / "train_sogs_one_hour.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("--max_runtime_minutes", launcher)
+        self.assertIn("--checkpoint_interval 500", launcher)
+        self.assertNotIn("--resolution 2", launcher)
+
+    def test_a100_profiles_are_explicit_and_do_not_launch_implicitly(self):
+        root = Path(__file__).resolve().parent
+        launcher = (
+            root / "scripts" / "train_sogs_a100.sh"
+        ).read_text(encoding="utf-8")
+        throughput = (
+            root / "configs" / "sogs_a100_throughput.yaml"
+        ).read_text(encoding="utf-8")
+        quality = (
+            root / "configs" / "sogs_a100_quality.yaml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("--sogs_checkpointing False", launcher)
+        self.assertIn("--sogs_cache_render_features True", launcher)
+        self.assertIn("--tf32_mode enabled", launcher)
+        self.assertIn("--tf32_mode disabled", launcher)
+        self.assertIn("--appearance_dim 0", launcher)
+        self.assertIn("--resolution 1", launcher)
+        self.assertIn("DRY_RUN", launcher)
+        self.assertIn("feat_dim: 16", throughput)
+        self.assertIn("feat_dim: 32", quality)
+        self.assertIn("resolution: 1", throughput)
+        self.assertIn("resolution: 1", quality)
+
+    def test_a100_max_speed_runner_dry_run_is_non_mutating(self):
+        root = Path(__file__).resolve().parent
+        launcher = root / "scripts" / "run_sogs_a100_max_speed.sh"
+        launcher_text = launcher.read_text(encoding="utf-8")
+        self.assertIn("--query-compute-apps", launcher_text)
+        self.assertIn("No process was killed", launcher_text)
+
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory)
+            data_root = temporary_root / "data"
+            output_root = temporary_root / "models"
+            log_root = temporary_root / "logs"
+            (data_root / "synthetic" / "train").mkdir(parents=True)
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(launcher),
+                    "--dry-run",
+                    "--data-root",
+                    str(data_root),
+                    "--output-root",
+                    str(output_root),
+                    "--log-root",
+                    str(log_root),
+                    "synthetic",
+                ],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertIn("--test_iterations 1000000000", result.stdout)
+            self.assertIn("--skip_postprocess", result.stdout)
+            self.assertIn("--tf32_mode enabled", result.stdout)
+            self.assertIn("--log_interval 250", result.stdout)
+            self.assertIn("training was not started", result.stdout)
+            self.assertFalse(output_root.exists())
+            self.assertFalse(log_root.exists())
 
 
 if __name__ == "__main__":

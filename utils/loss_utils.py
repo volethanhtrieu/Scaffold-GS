@@ -12,6 +12,7 @@
 import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
+from functools import lru_cache
 from math import exp
 
 def l1_loss(network_output, gt):
@@ -36,6 +37,10 @@ def scaling_volume_regularization(scaling: torch.Tensor) -> torch.Tensor:
             "scaling must have shape K x 3 "
             f"(received {tuple(scaling.shape)})"
         )
+    if scaling.shape[0] == 0:
+        # INFERENCE: an aggressively culled view can contain no neural
+        # Gaussians; return a differentiable zero instead of mean(empty)=NaN.
+        return scaling.sum() * 0.0
 
     # COMPATIBILITY: torch 1.12's CUDA ``prod`` reduction uses an NVRTC
     # Jiterator kernel.  Its bundled CUDA 11.6 NVRTC rejects compute
@@ -59,27 +64,57 @@ def _as_bchw(image: torch.Tensor, name: str):
     )
 
 
+@lru_cache(maxsize=32)
+def _cached_sobel_kernels(channels, device_string, dtype):
+    """Build one grouped x/y Sobel bank per device/dtype/channel key."""
+
+    device = torch.device(device_string)
+    # PAPER: fixed 3x3 Sobel kernels highlight horizontal and vertical
+    # texture/geometry changes.  They are constructed on the input device and
+    # dtype, never assumed to be CUDA tensors. Caching avoids host-to-device
+    # kernel construction for every training view.
+    sobel_x = torch.tensor(
+        [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+        device=device,
+        dtype=dtype,
+    ).view(1, 1, 3, 3)
+    sobel_y = torch.tensor(
+        [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+        device=device,
+        dtype=dtype,
+    ).view(1, 1, 3, 3)
+    # INFERENCE: place x/y filters consecutively inside every channel group.
+    # One grouped convolution then emits [x0, y0, x1, y1, ...], reducing four
+    # per-loss convolution launches to one without changing the Sobel values.
+    return torch.cat([sobel_x, sobel_y], dim=0).repeat(
+        channels, 1, 1, 1
+    )
+
+
 def _sobel_gradient_maps(image: torch.Tensor):
     """Return horizontal/vertical Sobel maps for a BCHW floating tensor."""
 
     channels = image.shape[1]
-    # PAPER: fixed 3x3 Sobel kernels highlight horizontal and vertical
-    # texture/geometry changes.  They are constructed on the input device and
-    # dtype, never assumed to be CUDA tensors.
-    sobel_x = torch.tensor(
-        [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
-        device=image.device,
-        dtype=image.dtype,
-    ).view(1, 1, 3, 3)
-    sobel_y = torch.tensor(
-        [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
-        device=image.device,
-        dtype=image.dtype,
-    ).view(1, 1, 3, 3)
-    sobel_x = sobel_x.expand(channels, 1, 3, 3)
-    sobel_y = sobel_y.expand(channels, 1, 3, 3)
-    gradient_x = F.conv2d(image, sobel_x, padding=1, groups=channels)
-    gradient_y = F.conv2d(image, sobel_y, padding=1, groups=channels)
+    kernels = _cached_sobel_kernels(
+        channels,
+        str(image.device),
+        image.dtype,
+    )
+    gradients = F.conv2d(
+        image,
+        kernels,
+        padding=1,
+        groups=channels,
+    )
+    gradients = gradients.reshape(
+        image.shape[0],
+        channels,
+        2,
+        image.shape[-2],
+        image.shape[-1],
+    )
+    gradient_x = gradients[:, :, 0]
+    gradient_y = gradients[:, :, 1]
     return gradient_x, gradient_y
 
 
@@ -88,6 +123,7 @@ def selective_gradient_loss(
     target: torch.Tensor,
     *,
     reduction: str = "mean",
+    validate_finite: bool = True,
 ) -> torch.Tensor:
     """Compute SOGS's selective gradient loss for CHW or BCHW images.
 
@@ -97,6 +133,8 @@ def selective_gradient_loss(
     discrepancies also serve as dynamic region weights.  ``prediction`` and
     ``target`` must have identical shape and finite floating-point values.
     ``reduction`` may be ``"mean"`` or ``"sum"`` and always returns a scalar.
+    ``validate_finite=False`` skips full-image finite reductions for a
+    prevalidated throughput run; shape/device/dtype checks remain active.
     """
 
     prediction_bchw, _ = _as_bchw(prediction, "prediction")
@@ -114,9 +152,12 @@ def selective_gradient_loss(
         raise ValueError("prediction and target must use floating-point dtypes")
     if prediction_bchw.device != target_bchw.device:
         raise ValueError("prediction and target must be on the same device")
-    if not torch.isfinite(prediction_bchw).all().item() or not torch.isfinite(
-        target_bchw
-    ).all().item():
+    if not isinstance(validate_finite, bool):
+        raise ValueError("validate_finite must be a boolean")
+    if validate_finite and (
+        not torch.isfinite(prediction_bchw).all().item()
+        or not torch.isfinite(target_bchw).all().item()
+    ):
         raise ValueError("prediction and target must not contain NaN or infinite values")
     if reduction not in {"mean", "sum"}:
         raise ValueError("reduction must be 'mean' or 'sum'")
@@ -131,10 +172,16 @@ def selective_gradient_loss(
     )
     prediction_bchw = prediction_bchw.to(dtype=work_dtype)
     target_bchw = target_bchw.to(dtype=work_dtype)
-    prediction_gradient_x, prediction_gradient_y = _sobel_gradient_maps(
-        prediction_bchw
-    )
-    target_gradient_x, target_gradient_y = _sobel_gradient_maps(target_bchw)
+    # INFERENCE: prediction and target share shape/device/dtype, so process
+    # them as one batch. Together with the grouped x/y bank above, this is one
+    # convolution launch rather than four independent launches.
+    combined = torch.cat([prediction_bchw, target_bchw], dim=0)
+    combined_gradient_x, combined_gradient_y = _sobel_gradient_maps(combined)
+    batch_size = prediction_bchw.shape[0]
+    prediction_gradient_x = combined_gradient_x[:batch_size]
+    target_gradient_x = combined_gradient_x[batch_size:]
+    prediction_gradient_y = combined_gradient_y[:batch_size]
+    target_gradient_y = combined_gradient_y[batch_size:]
 
     difference_x = prediction_gradient_x - target_gradient_x
     difference_y = prediction_gradient_y - target_gradient_y
@@ -153,7 +200,7 @@ def selective_gradient_loss(
         loss = loss_map.mean()
     # A finite check catches overflow in very low-precision execution without
     # silently propagating an invalid training objective.
-    if not torch.isfinite(loss).all().item():
+    if validate_finite and not torch.isfinite(loss).all().item():
         raise ValueError("selective gradient loss became NaN or infinite")
     return loss
 
@@ -167,13 +214,27 @@ def create_window(window_size, channel):
     window = Variable(_2D_window.expand(channel, 1, window_size, window_size).contiguous())
     return window
 
+
+@lru_cache(maxsize=32)
+def _cached_ssim_window(window_size, channel, device_string, dtype):
+    """Return an immutable SSIM window reused across training views."""
+
+    return create_window(window_size, channel).to(
+        device=torch.device(device_string),
+        dtype=dtype,
+    )
+
+
 def ssim(img1, img2, window_size=11, size_average=True):
     channel = img1.size(-3)
-    window = create_window(window_size, channel)
-
-    if img1.is_cuda:
-        window = window.cuda(img1.get_device())
-    window = window.type_as(img1)
+    # COMPATIBILITY: this is the same Gaussian window as before; only its
+    # allocation and device transfer are cached.
+    window = _cached_ssim_window(
+        window_size,
+        channel,
+        str(img1.device),
+        img1.dtype,
+    )
 
     return _ssim(img1, img2, window, window_size, channel, size_average)
 

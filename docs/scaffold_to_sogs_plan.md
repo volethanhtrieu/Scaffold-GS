@@ -5,19 +5,27 @@
 | Item | Value |
 |---|---|
 | Repository root | `/home/trieu_kernel/Desktop/Viettel_drone/Scaffold-GS` |
-| Branch | `main` |
-| Commit | `9718569d385c618f551242402a26a7db34259c56` |
-| Working tree | Clean before this migration |
-| Dedicated branch | `feature/sogs-integration` could not be created because `.git` is read-only in this environment |
+| Branch | `feature/sogs-integration` |
+| Commit | `ddef7063f56201e1b4b046d504845c4f31ea382a` |
+| Working tree | Dirty before this A100 pass: `README.md`, `docs/sogs_run_guide.md`, `docs/sogs_verification_report.md`, `test_sogs.py`, `train.py`, and `train_competition.py`; untracked `configs/sogs_one_hour.yaml`, `scripts/train_sogs_one_hour.sh`, and `utils/training_budget.py` |
+| Dedicated branch | Already on `feature/sogs-integration`; existing user changes will be preserved |
 | Training status | Training has not been and will not be executed during preparation |
 
 The local repository contains competition-specific data validation and rendering
 helpers in addition to the upstream Scaffold-GS code. Those interfaces remain in
-place; SOGS is an opt-in extension. No unofficial SOGS source tree or URL was
-present in the workspace, and the public paper/project pages inspected during
-analysis did not expose an implementation. Consequently, paper-specified
-equations take precedence and implementation gaps are explicitly marked as
-inferences rather than attributed to unavailable reference code.
+place; SOGS is an opt-in extension. The current branch already contains the
+core SOGS migration, while the dirty files contain an in-progress bounded
+one-hour profile. No unofficial SOGS source tree or URL is present in this
+workspace. Consequently, paper-specified equations take precedence and
+implementation gaps are explicitly marked as inferences rather than attributed
+to unavailable reference code.
+
+The competition PDFs require exact output names/counts/resolutions, prohibit
+external scene data and manual output editing, and may request source,
+configuration, dependency versions, checkpoints, and logs for reproducibility.
+The score weights LPIPS at 0.4, SSIM at 0.3, and normalized PSNR at 0.3. No
+training-time or model-size term is stated. The round-one document gives a
+20-GiB RTX A4000 as an inference reference, not a training limit.
 
 ## Migration components
 
@@ -29,6 +37,24 @@ inferences rather than attributed to unavailable reference code.
 | Loss            | L1, D-SSIM, and `0.01 *` volume regularization are used in `train.py` | Preserve those coefficients and add isolated Sobel selective-gradient loss weighted by `lambda_sgl` only for enabled SOGS | `utils/loss_utils.py`, `train.py` | High   | Synthetic image loss tests |
 | Checkpoints     | PLY stores anchor tensors; split MLP TorchScript files and a legacy tuple checkpoint are used | Store SOGS configuration and second-order MLP state, validate metadata, restore all trainable modules, and reject incompatible/missing SOGS state | `scene/gaussian_model.py`, `scene/__init__.py`, `train.py`, `render.py`, `render_test_poses.py` | High   | Save/load round-trip and incompatibility tests |
 | Configuration   | `cfg_args` records the parsed `Namespace`; scripts expose only baseline knobs | Persist all SOGS knobs in `cfg_args` and metadata; add baseline/default/compact config examples and opt-in scripts | `arguments/__init__.py`, `configs/`, `scripts/`, `train.sh`, `train_competition.py` | Medium | Configuration dump and shell lint |
+
+## A100 optimization delta
+
+The target reported by the user is one NVIDIA A100-SXM4-80GB (SM80). The
+reported active process used about 2.4 GiB while showing 87% GPU utilization.
+This telemetry is useful for profile design but is not a benchmark: the A100 is
+not exposed in the present workspace.
+
+| Change | Compatibility behavior | A100 intent | Target files | Risk | Verification |
+|---|---|---|---|---|---|
+| SOGS activation checkpoint switch | Keep checkpointing enabled by default | Disable recomputation when 80 GiB is available | `arguments/__init__.py`, `utils/sogs_utils.py`, `scene/gaussian_model.py`, `gaussian_renderer/__init__.py` | Medium | Forward/backward equivalence test |
+| Larger visible-anchor chunks | Keep the existing conservative default | Feed larger matrices to the A100 and reduce Python/kernel-launch overhead | Config and launcher files | Medium | Shape test and later authorized benchmark |
+| Evaluation feature cache | Disabled by default and only active in eval with gradients disabled | Reuse frozen augmented features over the 40--70 competition target views | `scene/gaussian_model.py` | Medium | Cache invalidation/value test |
+| Single symmetric eigensolve | Preserve the same selected eigenvector path | Reuse eigenvalues from `eigh` instead of launching a redundant `eigvalsh` | `utils/sogs_utils.py` | Low | Numerical/gradient tests |
+| Runtime math controls | FP32/legacy optimizer behavior remains the default | Opt in to TF32, cuDNN autotuning, and fused Adam when supported | `arguments/__init__.py`, `train.py`, `scene/gaussian_model.py` | Medium | Parser/runtime smoke tests; score A/B test required |
+| Loss-kernel caching/fusion | Preserve the same Sobel and SSIM equations | Cache fixed kernels and evaluate prediction/target x/y Sobel maps in one grouped convolution | `utils/loss_utils.py` | Low | Synthetic image equality test |
+| Reduced host synchronization | Preserve loss and optimizer math; only logging cadence changes when requested | Avoid per-iteration `.item()`/CUDA timing stalls | `train.py` | Low | Static test and later profiler trace |
+| Separate profiles | Baseline and paper-default profiles remain available | Expose speed-first and quality-first A100 commands without claiming either wins | `configs/`, `scripts/`, documentation | Low | Dry-run command checks |
 
 ## Feature-dimension flow
 
@@ -97,6 +123,13 @@ time.
 | Floor channel variances at `eps²` before taking their square root | Inference required for finite gradients from Scaffold-GS's zero-initialized anchor features; the paper does not specify zero-variance handling | High | Detach covariance eigenvectors, which would change the gradient path and is not specified by the paper |
 | Compute scene-global statistics but checkpoint SOGS branches and renderer attribute-MLP activations over visible-anchor chunks | Inference for 24-GiB runtime constraints; preserves the paper's global statistics and differentiable feature path while reducing retained activations | Medium | Disable checkpointing for maximum throughput, or detach statistics for a larger but method-altering memory reduction |
 | Map visible/selected offsets to global densification-statistics indices directly | Local Scaffold-GS mask semantics; allocation-only compatibility optimization | High | Build and clone full scene-wide boolean masks as in the original implementation |
+| Disable SOGS activation checkpointing only in the A100 profiles | User-provided 80-GiB capacity plus PyTorch checkpoint semantics | Medium | Retain checkpointing if measured peak memory is unsafe |
+| Cache full augmented anchor features only while the model is in eval mode and autograd is disabled | Inference from frozen inference state and multi-view competition rendering | High | Cache only eigenvectors, which saves less work but uses less memory |
+| Offer TF32 as an opt-in speed setting, not a quality guarantee | Official PyTorch CUDA semantics for Ampere; competition metrics are sensitive to output changes | Medium | Full IEEE FP32 matmul in the quality-control run |
+| Offer fused Adam only after checking that the installed PyTorch exposes it | Official PyTorch optimizer interface; local legacy environment is PyTorch 1.12.1 | Medium | Use PyTorch's default Adam implementation |
+| Use `D=32, M=2, lambda_sgl=0.01` as the quality-first A100 candidate | Paper reports that quality rises with D and gains diminish beyond D=16; competition does not score model size | Medium | Paper-size `D=16` candidate, selected by controlled scene validation |
+| Keep full input/output resolution, ten offsets, and 30,000 iterations in quality candidates | Competition requirements and SOGS/Scaffold-GS paper protocol | High | Change only after an authorized, controlled resource/quality experiment |
+| Do not enable whole-model `torch.compile` or AMP in this pass | The renderer is a custom CUDA autograd extension, anchor tensors/optimizer state change during densification, and neither mixed-precision rasterization nor graph capture was verified | High | Add an isolated experiment after extension-level CUDA tests |
 
 ## Verification targets
 

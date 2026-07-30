@@ -6,5 +6,10 @@ num_eigenvectors: 2
 lambda_sgl: 0.01
 # Runtime memory control: lower this from 2048 to 1024 if a 24-GiB GPU OOMs.
 sogs_chunk_size: 2048
+sogs_checkpointing: true
+sogs_validate_numerics: true
+sogs_cache_render_features: false
+# Preserve the conservative SOGS densification tile used on 24-GiB cards.
+densification_chunk_size: 1024
 n_offsets: 10
 iterations: 30000

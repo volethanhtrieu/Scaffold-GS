@@ -9,7 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 import torch
-from torch.utils.checkpoint import checkpoint
+from utils.checkpoint_utils import activation_checkpoint
 
 import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
@@ -38,9 +38,10 @@ def _run_attribute_mlp_chunked(
             parts.append(appearance)
         return module(torch.cat(parts, dim=1))
 
-    # COMPATIBILITY: keep the original single-call path for inference and for
-    # small batches; training SOGS uses checkpointed chunks to reduce VRAM.
-    if not checkpointed or n_rows <= chunk_size:
+    # COMPATIBILITY: keep the original single-call path for small batches.
+    # Larger batches honor the explicit activation budget even when an A100
+    # profile retains activations instead of checkpointing them.
+    if n_rows <= chunk_size:
         parts = [features, view_direction]
         if include_distance:
             parts.append(distance)
@@ -58,10 +59,10 @@ def _run_attribute_mlp_chunked(
             parts.append(appearance[start:end])
         inputs = torch.cat(parts, dim=1)
         is_script_module = isinstance(module, torch.jit.ScriptModule)
-        if inputs.requires_grad and not is_script_module:
+        if checkpointed and inputs.requires_grad and not is_script_module:
             # INFERENCE: reentrant checkpointing is supported by the legacy
             # PyTorch 1.12 environment used by the competition machine.
-            outputs.append(checkpoint(module, inputs))
+            outputs.append(activation_checkpoint(module, inputs))
         else:
             outputs.append(module(inputs))
     return torch.cat(outputs, dim=0)
@@ -133,7 +134,11 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     if needs_distance_features:
         assert feat.shape[1] + ob_view.shape[1] + ob_dist.shape[1] == expected_dim + 4
     chunk_size = getattr(pc, "sogs_chunk_size", 2048)
-    checkpoint_attributes = bool(pc.use_second_order and is_training)
+    checkpoint_attributes = bool(
+        pc.use_second_order
+        and is_training
+        and pc.sogs_checkpointing
+    )
     if pc.appearance_dim > 0:
         # COMPATIBILITY: appearance IDs only need the visible-row count; do
         # not force construction of the optional distance feature tensor.

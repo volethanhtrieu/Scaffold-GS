@@ -1,0 +1,25 @@
+# A100-SXM4-80GB throughput-first SOGS candidate.
+# INFERENCE: this is an explicit benchmark profile, not a claimed winner.
+method: sogs_a100_throughput
+use_second_order: true
+feat_dim: 16
+num_eigenvectors: 2
+lambda_sgl: 0.01
+n_offsets: 10
+appearance_dim: 0
+resolution: 1
+iterations: 30000
+
+# Use the A100's memory to avoid activation recomputation and small MLP calls.
+sogs_chunk_size: 65536
+sogs_checkpointing: false
+sogs_validate_numerics: false
+sogs_cache_render_features: true
+densification_chunk_size: 8192
+
+# These settings may change floating-point rounding and must be score-tested.
+tf32_mode: enabled
+cudnn_benchmark: true
+optimizer_backend: auto
+log_interval: 50
+disable_gui: true

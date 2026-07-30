@@ -15,10 +15,17 @@ from typing import Iterable, List, Optional, Sequence
 
 from arguments import (
     str2bool,
+    validate_optimizer_backend,
+    validate_positive_int,
     validate_sogs_chunk_size,
     validate_sogs_config,
+    validate_tf32_mode,
 )
 from prepare_data import discover_scenes, validate_scene
+from utils.training_budget import (
+    validate_checkpoint_interval,
+    validate_max_runtime_minutes,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,6 +55,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional scene names; all scenes are used when omitted.",
     )
     parser.add_argument("--iterations", type=int, default=30_000)
+    parser.add_argument(
+        "--max-runtime-minutes",
+        type=float,
+        default=0.0,
+        help=(
+            "Per-scene training budget. The child process saves a model and "
+            "resumable checkpoint before stopping; zero disables the limit."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=0,
+        help=(
+            "Save a resumable checkpoint every N iterations; zero disables "
+            "periodic checkpoints."
+        ),
+    )
     parser.add_argument("--voxel-size", type=float, default=0.001)
     parser.add_argument("--update-init-factor", type=int, default=16)
     parser.add_argument("--feat-dim", type=int, default=32)
@@ -72,9 +97,70 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=2048,
         help=(
-            "Maximum anchors per SOGS/renderer/densification chunk "
+            "Maximum anchors per SOGS/renderer activation chunk "
             "(lower uses less VRAM)."
         ),
+    )
+    parser.add_argument(
+        "--sogs-checkpointing",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Recompute SOGS/attribute MLP activations during backward.",
+    )
+    parser.add_argument(
+        "--sogs-validate-numerics",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Run full finite-value reductions inside SOGS and SGL.",
+    )
+    parser.add_argument(
+        "--sogs-cache-render-features",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Cache all augmented anchors during no-grad evaluation.",
+    )
+    parser.add_argument(
+        "--tf32-mode",
+        default="default",
+        choices=("default", "enabled", "disabled"),
+        help="CUDA float32 matmul policy.",
+    )
+    parser.add_argument(
+        "--cudnn-benchmark",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Enable the cuDNN convolution autotuner.",
+    )
+    parser.add_argument(
+        "--optimizer-backend",
+        default="default",
+        choices=("default", "auto", "foreach", "fused", "single"),
+        help="Adam implementation requested from the installed PyTorch.",
+    )
+    parser.add_argument(
+        "--densification-chunk-size",
+        type=int,
+        default=4096,
+        help="Anchor rows per duplicate-check tile during densification.",
+    )
+    parser.add_argument(
+        "--log-interval",
+        type=int,
+        default=1,
+        help="Write synchronized scalar logs every N iterations.",
+    )
+    parser.add_argument(
+        "--disable-gui",
+        action="store_true",
+        help="Disable the training GUI connection check.",
     )
     parser.add_argument(
         "--appearance-dim",
@@ -146,6 +232,22 @@ def training_command(
         str(args.lambda_sgl),
         "--sogs_chunk_size",
         str(args.sogs_chunk_size),
+        "--sogs_checkpointing",
+        str(args.sogs_checkpointing),
+        "--sogs_validate_numerics",
+        str(args.sogs_validate_numerics),
+        "--sogs_cache_render_features",
+        str(args.sogs_cache_render_features),
+        "--tf32_mode",
+        str(args.tf32_mode),
+        "--cudnn_benchmark",
+        str(args.cudnn_benchmark),
+        "--optimizer_backend",
+        str(args.optimizer_backend),
+        "--densification_chunk_size",
+        str(args.densification_chunk_size),
+        "--log_interval",
+        str(args.log_interval),
         "--appearance_dim",
         str(args.appearance_dim),
         "--ratio",
@@ -156,6 +258,10 @@ def training_command(
         str(args.iterations),
         "--save_iterations",
         str(args.iterations),
+        "--max_runtime_minutes",
+        str(args.max_runtime_minutes),
+        "--checkpoint_interval",
+        str(args.checkpoint_interval),
         "--port",
         str(port),
         "--gpu",
@@ -166,6 +272,8 @@ def training_command(
         command.append("--warmup")
     if args.white_background:
         command.append("--white_background")
+    if args.disable_gui:
+        command.append("--disable_gui")
     return command
 
 
@@ -216,8 +324,24 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             args.lambda_sgl,
         )
         validate_sogs_chunk_size(args.sogs_chunk_size)
+        validate_tf32_mode(args.tf32_mode)
+        validate_optimizer_backend(args.optimizer_backend)
+        args.densification_chunk_size = validate_positive_int(
+            args.densification_chunk_size,
+            name="densification_chunk_size",
+        )
+        args.log_interval = validate_positive_int(
+            args.log_interval,
+            name="log_interval",
+        )
+        args.max_runtime_minutes = validate_max_runtime_minutes(
+            args.max_runtime_minutes
+        )
+        args.checkpoint_interval = validate_checkpoint_interval(
+            args.checkpoint_interval
+        )
     except ValueError as error:
-        print(f"invalid SOGS configuration: {error}", file=sys.stderr)
+        print(f"invalid training configuration: {error}", file=sys.stderr)
         return 2
 
     try:

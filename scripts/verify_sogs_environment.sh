@@ -88,7 +88,11 @@ required_paths=(
     render_test_poses.py
     generate_submission.py
     test_sogs.py
+    utils/checkpoint_utils.py
+    utils/runtime_utils.py
     utils/sogs_utils.py
+    scripts/run_sogs_a100_max_speed.sh
+    scripts/train_sogs_a100.sh
     submodules/diff-gaussian-rasterization/setup.py
     submodules/simple-knn/setup.py
 )
@@ -269,6 +273,13 @@ try:
     print("Small CUDA tensor operation: OK")
     print("CUDA volume regularization: OK")
     print("CUDA zero-variance SOGS backward: OK")
+
+    from utils.runtime_utils import configure_torch_runtime
+    runtime_settings = configure_torch_runtime(
+        tf32_mode="default",
+        cudnn_benchmark=False,
+    )
+    print("Resolved default runtime policy:", runtime_settings)
 except Exception:
     traceback.print_exc()
     sys.exit(1)
@@ -332,6 +343,9 @@ shell_sources=(
     single_train.sh
     scripts/train_scaffold_baseline.sh
     scripts/train_sogs.sh
+    scripts/train_sogs_a100.sh
+    scripts/run_sogs_a100_max_speed.sh
+    scripts/train_sogs_one_hour.sh
     scripts/render_sogs.sh
     scripts/verify_sogs_environment.sh
 )

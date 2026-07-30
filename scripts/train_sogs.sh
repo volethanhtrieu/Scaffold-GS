@@ -24,6 +24,10 @@ command=(
     --num_eigenvectors 2
     --lambda_sgl 0.01
     --sogs_chunk_size 2048
+    --sogs_checkpointing True
+    --sogs_validate_numerics True
+    --sogs_cache_render_features False
+    --densification_chunk_size 1024
     "$@"
 )
 

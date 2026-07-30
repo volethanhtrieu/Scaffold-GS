@@ -12,6 +12,7 @@
 import torch
 import numpy as np
 import json
+import inspect
 from torch_scatter import scatter_max
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func
 from torch import nn
@@ -26,7 +27,13 @@ from utils.sogs_utils import (
     SecondOrderFeatureAugmentor,
     validate_second_order_dimensions,
 )
-from arguments import validate_sogs_chunk_size, validate_sogs_config
+from arguments import (
+    str2bool,
+    validate_optimizer_backend,
+    validate_positive_int,
+    validate_sogs_chunk_size,
+    validate_sogs_config,
+)
 
     
 class GaussianModel:
@@ -67,6 +74,9 @@ class GaussianModel:
                  lambda_sgl: float = 0.01,
                  device=None,
                  sogs_chunk_size: int = 2048,
+                 sogs_checkpointing: bool = True,
+                 sogs_validate_numerics: bool = True,
+                 sogs_cache_render_features: bool = False,
                  ):
 
         # COMPATIBILITY: append SOGS settings after the original positional
@@ -88,6 +98,13 @@ class GaussianModel:
             enabled=self.use_second_order,
         )
         self.sogs_chunk_size = validate_sogs_chunk_size(sogs_chunk_size)
+        self.sogs_checkpointing = str2bool(sogs_checkpointing)
+        self.sogs_validate_numerics = str2bool(
+            sogs_validate_numerics
+        )
+        self.sogs_cache_render_features = str2bool(
+            sogs_cache_render_features
+        )
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
@@ -127,6 +144,8 @@ class GaussianModel:
         self.active_sh_degree = 0
                 
         self.optimizer = None
+        self.optimizer_backend = "default"
+        self.densification_chunk_size = 4096
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
@@ -141,10 +160,14 @@ class GaussianModel:
                 self.feat_dim,
                 self.num_eigenvectors,
                 chunk_size=self.sogs_chunk_size,
+                checkpointing=self.sogs_checkpointing,
+                validate_numerics=self.sogs_validate_numerics,
             ).to(self.device)
             if self.use_second_order
             else None
         )
+        self._render_features_cache = None
+        self._render_features_cache_key = None
 
         if self.use_feat_bank:
             self.mlp_feature_bank = nn.Sequential(
@@ -187,6 +210,7 @@ class GaussianModel:
 
 
     def eval(self):
+        self._clear_render_features_cache()
         self.mlp_opacity.eval()
         self.mlp_cov.eval()
         self.mlp_color.eval()
@@ -198,6 +222,7 @@ class GaussianModel:
             self.mlp_feature_bank.eval()
 
     def train(self):
+        self._clear_render_features_cache()
         self.mlp_opacity.train()
         self.mlp_cov.train()
         self.mlp_color.train()
@@ -207,6 +232,26 @@ class GaussianModel:
             self.embedding_appearance.train()
         if self.use_feat_bank:                   
             self.mlp_feature_bank.train()
+
+    def _clear_render_features_cache(self):
+        """Invalidate eval-only augmented features after any train/eval change."""
+
+        self._render_features_cache = None
+        self._render_features_cache_key = None
+
+    def _render_cache_key(self):
+        """Return a lightweight mutation signature for frozen render state."""
+
+        feature_signature = (
+            self._anchor_feat.data_ptr(),
+            int(self._anchor_feat._version),
+            tuple(self._anchor_feat.shape),
+        )
+        branch_signature = tuple(
+            (parameter.data_ptr(), int(parameter._version))
+            for parameter in self.second_order_augmentor.parameters()
+        )
+        return feature_signature, branch_signature
 
     @property
     def get_render_feature_dim(self):
@@ -254,10 +299,31 @@ class GaussianModel:
             raise RuntimeError(
                 "SOGS is enabled but its second-order augmentor is not initialized"
             )
-        # PAPER: expose one feature path to every renderer consumer.
-        augmented_features = self.second_order_augmentor(
-            features, output_mask=visible_mask
+        cache_allowed = (
+            self.sogs_cache_render_features
+            and not self.second_order_augmentor.training
+            and not torch.is_grad_enabled()
         )
+        if cache_allowed:
+            # INFERENCE: competition rendering evaluates many fixed cameras.
+            # Materialize all frozen augmented rows once, then index the cache.
+            cache_key = self._render_cache_key()
+            if (
+                self._render_features_cache is None
+                or self._render_features_cache_key != cache_key
+            ):
+                self._render_features_cache = self.second_order_augmentor(
+                    features
+                )
+                self._render_features_cache_key = cache_key
+            augmented_features = self._render_features_cache
+            if visible_mask is not None:
+                augmented_features = augmented_features[visible_mask]
+        else:
+            # PAPER: expose one feature path to every renderer consumer.
+            augmented_features = self.second_order_augmentor(
+                features, output_mask=visible_mask
+            )
         expected_dim = self.feat_dim * (1 + self.num_eigenvectors)
         assert augmented_features.shape[-1] == expected_dim
         return augmented_features
@@ -272,6 +338,13 @@ class GaussianModel:
             "feat_dim": int(self.feat_dim),
             "render_feat_dim": int(self.render_feat_dim),
             "sogs_chunk_size": int(self.sogs_chunk_size),
+            "sogs_checkpointing": bool(self.sogs_checkpointing),
+            "sogs_validate_numerics": bool(
+                self.sogs_validate_numerics
+            ),
+            "sogs_cache_render_features": bool(
+                self.sogs_cache_render_features
+            ),
         }
 
     def _assert_checkpoint_compatible(self, checkpoint_config, *, source="checkpoint"):
@@ -296,6 +369,12 @@ class GaussianModel:
                 )
             return
         expected = self.get_sogs_config()
+        runtime_only_keys = {
+            "sogs_chunk_size",
+            "sogs_checkpointing",
+            "sogs_validate_numerics",
+            "sogs_cache_render_features",
+        }
         for key in (
             "use_second_order",
             "num_eigenvectors",
@@ -303,11 +382,14 @@ class GaussianModel:
             "feat_dim",
             "render_feat_dim",
             "sogs_chunk_size",
+            "sogs_checkpointing",
+            "sogs_validate_numerics",
+            "sogs_cache_render_features",
         ):
             if key not in checkpoint_config:
-                # COMPATIBILITY: older SOGS checkpoints predate the runtime
-                # memory knob; the default chunk size is safe for loading.
-                if self.use_second_order and key != "sogs_chunk_size":
+                # COMPATIBILITY: older SOGS checkpoints predate runtime-only
+                # controls. They do not change learned tensor shapes.
+                if self.use_second_order and key not in runtime_only_keys:
                     raise RuntimeError(
                         f"{source} is missing required SOGS setting {key!r}"
                     )
@@ -323,6 +405,20 @@ class GaussianModel:
                     raise RuntimeError(
                         f"invalid {source} setting sogs_chunk_size={actual!r}"
                     ) from error
+                continue
+            if key in {
+                "sogs_checkpointing",
+                "sogs_validate_numerics",
+                "sogs_cache_render_features",
+            }:
+                try:
+                    str2bool(actual)
+                except (TypeError, ValueError) as error:
+                    raise RuntimeError(
+                        f"invalid {source} setting {key}={actual!r}"
+                    ) from error
+                # INFERENCE: these settings only trade memory/synchronization
+                # for throughput, so loading with a different value is safe.
                 continue
             if key == "lambda_sgl":
                 try:
@@ -743,6 +839,10 @@ class GaussianModel:
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
+        self.densification_chunk_size = validate_positive_int(
+            getattr(training_args, "densification_chunk_size", 4096),
+            name="densification_chunk_size",
+        )
 
         self.opacity_accum = torch.zeros(
             (self.get_anchor.shape[0], 1), device=self.device
@@ -841,7 +941,94 @@ class GaussianModel:
                 }
             )
 
-        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        # Materialize generators once so optimizer capability selection cannot
+        # consume a parameter group more than once.
+        for parameter_group in l:
+            parameter_group["params"] = list(parameter_group["params"])
+
+        requested_backend = validate_optimizer_backend(
+            getattr(training_args, "optimizer_backend", "default")
+        )
+        try:
+            adam_parameters = set(
+                inspect.signature(torch.optim.Adam).parameters
+            )
+        except (TypeError, ValueError):
+            adam_parameters = set()
+
+        resolved_backend = requested_backend
+        if requested_backend == "auto":
+            if self.device.type == "cuda" and "fused" in adam_parameters:
+                resolved_backend = "fused"
+            elif "foreach" in adam_parameters:
+                resolved_backend = "foreach"
+            else:
+                resolved_backend = "default"
+
+        def _construct_adam(backend):
+            options = {}
+            if backend == "fused":
+                if "fused" not in adam_parameters:
+                    raise RuntimeError(
+                        "optimizer_backend='fused' requires a PyTorch Adam "
+                        "implementation with fused support"
+                    )
+                options["fused"] = True
+            elif backend == "foreach":
+                if "foreach" not in adam_parameters:
+                    raise RuntimeError(
+                        "optimizer_backend='foreach' is unsupported by this "
+                        "PyTorch build"
+                    )
+                options["foreach"] = True
+            elif backend == "single":
+                # Older PyTorch versions have no explicit foreach keyword;
+                # their ordinary Adam loop is the requested single-tensor path.
+                if "foreach" in adam_parameters:
+                    options["foreach"] = False
+            return torch.optim.Adam(
+                l,
+                lr=0.0,
+                eps=1e-15,
+                **options,
+            )
+
+        if requested_backend == "auto":
+            # INFERENCE: capability-based fallback keeps a modern fused build
+            # fast while remaining runnable on legacy PyTorch or a backend
+            # whose fused constructor rejects this parameter layout.
+            candidates = []
+            if self.device.type == "cuda" and "fused" in adam_parameters:
+                candidates.append("fused")
+            if "foreach" in adam_parameters:
+                candidates.append("foreach")
+            candidates.append("default")
+            construction_errors = []
+            self.optimizer = None
+            for candidate in candidates:
+                try:
+                    self.optimizer = _construct_adam(candidate)
+                    resolved_backend = candidate
+                    break
+                except (TypeError, RuntimeError, ValueError) as error:
+                    construction_errors.append(
+                        f"{candidate}: {error}"
+                    )
+            if self.optimizer is None:
+                raise RuntimeError(
+                    "could not construct any automatic Adam backend: "
+                    + " | ".join(construction_errors)
+                )
+        else:
+            try:
+                self.optimizer = _construct_adam(resolved_backend)
+            except (TypeError, RuntimeError, ValueError) as error:
+                raise RuntimeError(
+                    f"could not construct Adam backend {resolved_backend!r}: "
+                    f"{error}"
+                ) from error
+        self.optimizer_backend = resolved_backend
+        print(f"Adam optimizer backend: {self.optimizer_backend}")
         self.anchor_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
@@ -1185,15 +1372,10 @@ class GaussianModel:
             ## split data for reducing peak memory calling
             use_chunk = True
             if use_chunk:
-                # INFERENCE: reuse the SOGS runtime budget for the large
-                # densification duplicate-check tensor and cap it at 1024 for
-                # 24-GiB cards. Preserve Scaffold-GS's original 4096-row chunk
-                # when second-order mode is disabled.
-                chunk_size = (
-                    min(1024, self.sogs_chunk_size)
-                    if self.use_second_order
-                    else 4096
-                )
+                # INFERENCE: duplicate checking has a different temporary
+                # memory shape from SOGS MLP activations, so it uses its own
+                # explicit budget. The compatibility default remains 4096.
+                chunk_size = self.densification_chunk_size
                 max_iters = grid_coords.shape[0] // chunk_size + (1 if grid_coords.shape[0] % chunk_size != 0 else 0)
                 # INFERENCE: accumulate the reduction in-place instead of
                 # retaining one [candidate_count] boolean tensor per chunk.

@@ -116,6 +116,43 @@ def validate_sogs_chunk_size(value=2048):
     return normalized
 
 
+def validate_positive_int(value, *, name):
+    """Return a positive integer with a field-specific error message."""
+
+    if isinstance(value, bool) or not isinstance(value, (str, numbers.Integral)):
+        raise ValueError(f"{name} must be a positive integer")
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"{name} must be a positive integer") from error
+    if normalized <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return normalized
+
+
+def validate_tf32_mode(value="default"):
+    """Validate the opt-in CUDA float32 matmul policy."""
+
+    normalized = str(value).strip().lower()
+    if normalized not in {"default", "enabled", "disabled"}:
+        raise ValueError(
+            "tf32_mode must be one of: default, enabled, disabled"
+        )
+    return normalized
+
+
+def validate_optimizer_backend(value="default"):
+    """Validate the requested Adam implementation."""
+
+    normalized = str(value).strip().lower()
+    if normalized not in {"default", "auto", "foreach", "fused", "single"}:
+        raise ValueError(
+            "optimizer_backend must be one of: "
+            "default, auto, foreach, fused, single"
+        )
+    return normalized
+
+
 class GroupParams:
     pass
 
@@ -171,6 +208,17 @@ class ModelParams(ParamGroup):
         self.lambda_sgl = 0.01
         # INFERENCE: 2048 bounds SOGS branch activation memory on 24-GiB GPUs.
         self.sogs_chunk_size = 2048
+        # INFERENCE: checkpoint recomputation and finite-value checks are safe
+        # defaults. Large-memory profiles may disable them explicitly.
+        self.sogs_checkpointing = True
+        self.sogs_validate_numerics = True
+        # INFERENCE: full augmented-feature caching is useful for multi-view
+        # inference but is opt-in because its memory scales with N*D*(1+M).
+        self.sogs_cache_render_features = False
+        # COMPATIBILITY: runtime math defaults remain owned by the installed
+        # PyTorch build unless an experiment explicitly selects a policy.
+        self.tf32_mode = "default"
+        self.cudnn_benchmark = False
         self.n_offsets = 10
         self.voxel_size =  0.001 # if voxel_size<=0, using 1nn dist
         self.update_depth = 3
@@ -215,6 +263,16 @@ class ModelParams(ParamGroup):
             g.lambda_sgl = 0.01
         if getattr(g, "sogs_chunk_size", None) is None:
             g.sogs_chunk_size = 2048
+        if getattr(g, "sogs_checkpointing", None) is None:
+            g.sogs_checkpointing = True
+        if getattr(g, "sogs_validate_numerics", None) is None:
+            g.sogs_validate_numerics = True
+        if getattr(g, "sogs_cache_render_features", None) is None:
+            g.sogs_cache_render_features = False
+        if getattr(g, "tf32_mode", None) is None:
+            g.tf32_mode = "default"
+        if getattr(g, "cudnn_benchmark", None) is None:
+            g.cudnn_benchmark = False
         (
             g.feat_dim,
             g.use_second_order,
@@ -227,6 +285,13 @@ class ModelParams(ParamGroup):
             g.lambda_sgl,
         )
         g.sogs_chunk_size = validate_sogs_chunk_size(g.sogs_chunk_size)
+        g.sogs_checkpointing = str2bool(g.sogs_checkpointing)
+        g.sogs_validate_numerics = str2bool(g.sogs_validate_numerics)
+        g.sogs_cache_render_features = str2bool(
+            g.sogs_cache_render_features
+        )
+        g.tf32_mode = validate_tf32_mode(g.tf32_mode)
+        g.cudnn_benchmark = str2bool(g.cudnn_benchmark)
         g.source_path = os.path.abspath(g.source_path)
         return g
 
@@ -298,8 +363,25 @@ class OptimizationParams(ParamGroup):
         self.min_opacity = 0.005
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
+        # COMPATIBILITY: "default" constructs Adam exactly as before. A100
+        # profiles may request a supported fused/foreach implementation.
+        self.optimizer_backend = "default"
+        # INFERENCE: duplicate checks are tiled independently from SOGS feature
+        # activations because their temporary memory scales differently.
+        self.densification_chunk_size = 4096
 
         super().__init__(parser, "Optimization Parameters")
+
+    def extract(self, args):
+        g = super().extract(args)
+        g.optimizer_backend = validate_optimizer_backend(
+            g.optimizer_backend
+        )
+        g.densification_chunk_size = validate_positive_int(
+            g.densification_chunk_size,
+            name="densification_chunk_size",
+        )
+        return g
 
 def get_combined_args(parser : ArgumentParser):
     cmdlne_string = sys.argv[1:]

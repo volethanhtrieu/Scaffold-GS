@@ -7,5 +7,9 @@ num_eigenvectors: 1
 lambda_sgl: 0.01
 # Smaller chunks and fewer offsets trade throughput/capacity for lower VRAM.
 sogs_chunk_size: 1024
+sogs_checkpointing: true
+sogs_validate_numerics: true
+sogs_cache_render_features: false
+densification_chunk_size: 1024
 n_offsets: 5
 iterations: 30000

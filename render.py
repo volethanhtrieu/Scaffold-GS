@@ -39,6 +39,7 @@ from utils.general_utils import safe_state
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
+from utils.runtime_utils import configure_torch_runtime
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
@@ -93,6 +94,9 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
             num_eigenvectors=dataset.num_eigenvectors,
             lambda_sgl=dataset.lambda_sgl,
             sogs_chunk_size=dataset.sogs_chunk_size,
+            sogs_checkpointing=dataset.sogs_checkpointing,
+            sogs_validate_numerics=dataset.sogs_validate_numerics,
+            sogs_cache_render_features=dataset.sogs_cache_render_features,
         )
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         
@@ -119,9 +123,24 @@ if __name__ == "__main__":
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     args = get_combined_args(parser)
+    dataset_args = model.extract(args)
+    try:
+        runtime_settings = configure_torch_runtime(
+            tf32_mode=dataset_args.tf32_mode,
+            cudnn_benchmark=dataset_args.cudnn_benchmark,
+        )
+    except ValueError as error:
+        parser.error(str(error))
     print("Rendering " + args.model_path)
+    print(f"Torch runtime: {runtime_settings}")
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test)
+    render_sets(
+        dataset_args,
+        args.iteration,
+        pipeline.extract(args),
+        args.skip_train,
+        args.skip_test,
+    )

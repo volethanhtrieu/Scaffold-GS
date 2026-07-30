@@ -16,6 +16,7 @@ use_second_order="False"
 num_eigenvectors=2
 lambda_sgl=0.01
 sogs_chunk_size=2048
+densification_chunk_size=4096
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         -l|--logdir) logdir="$2"; shift ;;
@@ -33,6 +34,7 @@ while [[ "$#" -gt 0 ]]; do
         --num_eigenvectors) num_eigenvectors="$2"; shift ;;
         --lambda_sgl) lambda_sgl="$2"; shift ;;
         --sogs_chunk_size) sogs_chunk_size="$2"; shift ;;
+        --densification_chunk_size) densification_chunk_size="$2"; shift ;;
         *) echo "Unknown parameter passed: $1"; exit 1 ;;
     esac
     shift
@@ -49,7 +51,7 @@ if [ -d "${source_path}/train/images" ] && [ -d "${source_path}/train/sparse/0" 
 fi
 
 if [ "$warmup" = "True" ]; then
-    python train.py --eval -s "${source_path}" --lod ${lod} --gpu ${gpu} --voxel_size ${vsize} --update_init_factor ${update_init_factor} --appearance_dim ${appearance_dim} --ratio ${ratio} --feat_dim "${feat_dim}" --n_offsets "${n_offsets}" --use_second_order "${use_second_order}" --num_eigenvectors "${num_eigenvectors}" --lambda_sgl "${lambda_sgl}" --sogs_chunk_size "${sogs_chunk_size}" --warmup --iterations ${iterations} --port $port -m outputs/${data}/${logdir}/$time
+    python train.py --eval -s "${source_path}" --lod ${lod} --gpu ${gpu} --voxel_size ${vsize} --update_init_factor ${update_init_factor} --appearance_dim ${appearance_dim} --ratio ${ratio} --feat_dim "${feat_dim}" --n_offsets "${n_offsets}" --use_second_order "${use_second_order}" --num_eigenvectors "${num_eigenvectors}" --lambda_sgl "${lambda_sgl}" --sogs_chunk_size "${sogs_chunk_size}" --densification_chunk_size "${densification_chunk_size}" --warmup --iterations ${iterations} --port $port -m outputs/${data}/${logdir}/$time
 else
-    python train.py --eval -s "${source_path}" --lod ${lod} --gpu ${gpu} --voxel_size ${vsize} --update_init_factor ${update_init_factor} --appearance_dim ${appearance_dim} --ratio ${ratio} --feat_dim "${feat_dim}" --n_offsets "${n_offsets}" --use_second_order "${use_second_order}" --num_eigenvectors "${num_eigenvectors}" --lambda_sgl "${lambda_sgl}" --sogs_chunk_size "${sogs_chunk_size}" --iterations ${iterations} --port $port -m outputs/${data}/${logdir}/$time
+    python train.py --eval -s "${source_path}" --lod ${lod} --gpu ${gpu} --voxel_size ${vsize} --update_init_factor ${update_init_factor} --appearance_dim ${appearance_dim} --ratio ${ratio} --feat_dim "${feat_dim}" --n_offsets "${n_offsets}" --use_second_order "${use_second_order}" --num_eigenvectors "${num_eigenvectors}" --lambda_sgl "${lambda_sgl}" --sogs_chunk_size "${sogs_chunk_size}" --densification_chunk_size "${densification_chunk_size}" --iterations ${iterations} --port $port -m outputs/${data}/${logdir}/$time
 fi

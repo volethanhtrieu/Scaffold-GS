@@ -172,7 +172,8 @@ outputs/round1/
 └── chair/
 ```
 
-Each scene should contain `cfg_args`, `outputs.log`, and the final checkpoint:
+Each scene should contain `cfg_args`, `runtime_config.json`, `outputs.log`, and
+the final checkpoint:
 
 ```text
 outputs/round1/<scene>/point_cloud/iteration_30000/
@@ -351,6 +352,12 @@ The training parameters used above mean:
 | `--feat-dim 16` | `--feat_dim 16` | Base anchor width `D=16` |
 | `--num-eigenvectors 2` | `--num_eigenvectors 2` | Select `M=2` directions |
 | `--lambda-sgl 0.01` | `--lambda_sgl 0.01` | Selective-gradient-loss weight |
+| `--sogs-checkpointing False` | `--sogs_checkpointing False` | Retain activations instead of recomputing them |
+| `--sogs-cache-render-features True` | `--sogs_cache_render_features True` | Cache frozen augmented features across eval cameras |
+| `--tf32-mode enabled` | `--tf32_mode enabled` | Opt into Ampere TF32 matmul/convolution |
+| `--optimizer-backend auto` | `--optimizer_backend auto` | Select fused, then foreach, when supported |
+| `--densification-chunk-size 8192` | `--densification_chunk_size 8192` | Tile the anchor duplicate check independently |
+| `--log-interval 50` | `--log_interval 50` | Synchronize scalar logs every 50 iterations |
 
 The render feature width is:
 
@@ -366,10 +373,137 @@ Reference profiles are documented in:
 - [`configs/scaffold_gs_baseline.yaml`](../configs/scaffold_gs_baseline.yaml)
 - [`configs/sogs_default.yaml`](../configs/sogs_default.yaml)
 - [`configs/sogs_compact.yaml`](../configs/sogs_compact.yaml)
+- [`configs/sogs_one_hour.yaml`](../configs/sogs_one_hour.yaml)
+- [`configs/sogs_a100_throughput.yaml`](../configs/sogs_a100_throughput.yaml)
+- [`configs/sogs_a100_quality.yaml`](../configs/sogs_a100_quality.yaml)
 
 The YAML files document profiles; `train_competition.py` receives the settings
 through command-line arguments and stores the resolved configuration in each
 scene's `cfg_args`.
+
+## 9A. A100-SXM4-80GB profiles
+
+The user-provided `nvidia-smi` output reports one SM80 A100 with 80 GiB.
+CUDA `13.0` in that output is the maximum CUDA version supported by the
+driver; the PyTorch CUDA runtime and the toolkit used to compile the two local
+extensions must still match each other. Do not rebuild the extensions merely
+because the driver reports a newer version.
+
+The shortest full-speed path trains all seven scenes sequentially with the
+throughput profile:
+
+```bash
+# Preview all commands without touching the GPU or outputs.
+scripts/run_sogs_a100_max_speed.sh --dry-run
+
+# Starts training after verification and the idle-GPU check pass.
+scripts/run_sogs_a100_max_speed.sh
+```
+
+The launcher keeps full image resolution, SOGS `D=16`, `M=2`, ten offsets,
+SGL weight `0.01`, and 30,000 iterations. It enables TF32 and the fastest Adam
+backend supported by the active PyTorch, avoids activation recomputation and
+training-time evaluation, and reduces synchronized progress logging. It
+refuses a busy GPU or non-empty per-scene output directory; it does not kill
+processes or delete results.
+
+First verify that no unrelated process is consuming the GPU. The supplied
+snapshot showed PID 8129 at 87% utilization, so a second training process would
+compete with it. Then inspect either command without launching training:
+
+```bash
+DRY_RUN=1 scripts/train_sogs_a100.sh throughput \
+  data/HCM0421/train \
+  outputs/a100_throughput/HCM0421
+
+DRY_RUN=1 scripts/train_sogs_a100.sh quality \
+  data/HCM0421/train \
+  outputs/a100_quality/HCM0421
+```
+
+The launcher requires a new or empty output path. Remove `DRY_RUN=1` only when
+training is intentionally authorized.
+
+| Setting | Throughput candidate | Quality-control candidate |
+|---|---:|---:|
+| Base feature `D` | 16 | 32 |
+| Selected directions `M` | 2 | 2 |
+| Render width `D*(1+M)` | 48 | 96 |
+| SGL weight | 0.01 | 0.01 |
+| Offsets | 10 | 10 |
+| Appearance embedding | Disabled (`A=0`) | Disabled (`A=0`) |
+| Activation checkpointing | Off | Off |
+| Full finite reductions | Off | On |
+| Eval feature cache | On | On |
+| TF32 | Enabled | Disabled |
+| Adam backend | Auto (fused/foreach when exposed) | Original default |
+| Iterations/resolution | 30,000/full | 30,000/full |
+
+Disabling checkpointing is the principal 80-GiB optimization: it avoids
+recomputing every SOGS and attribute-MLP activation during backward. The
+throughput candidate also avoids full-tensor finite checks, writes synchronized
+logs every 50 iterations, enables cuDNN autotuning, and opts into TF32. Those
+changes should improve throughput but can change floating-point rounding; they
+must be compared against the FP32 control using the competition metrics.
+
+`sogs_cache_render_features=True` is active only in eval mode under
+`torch.no_grad()`. It materializes the frozen `N x D*(1+M)` tensor once and
+reuses it for the 40--70 target cameras. Returning to training invalidates the
+cache.
+
+## 9B. From-scratch one-hour fallback
+
+The following launcher targets one scene and one 24-GiB GPU:
+
+```bash
+scripts/train_sogs_one_hour.sh \
+  data/HCM0421/train \
+  outputs/one_hour/HCM0421
+```
+
+The output path must be new or empty. The profile uses `D=12`, `M=1`, five
+offsets, `ratio=4`, a 0.002 voxel size, and a 3,000-iteration ceiling. It keeps
+the original image resolution so later competition rendering is not silently
+reduced. Selective gradient loss is disabled because this is a speed-oriented
+SOGS ablation rather than the paper-default objective.
+
+`--max_runtime_minutes 55` reserves approximately five minutes of the
+one-hour allocation for serialization. The exact completed iteration depends
+on the scene. At the deadline, training finishes the active optimizer step and
+saves both:
+
+```text
+point_cloud/iteration_<N>/point_cloud.ply
+chkpnt<N>.pth
+```
+
+The first path is renderable and the second contains optimizer/module state for
+later resumption. Additional resumable checkpoints are written every 500
+iterations. No quality or score equivalence with a 30,000-iteration SOGS run
+is implied.
+
+To resume the same compact configuration after an interruption, keep the
+existing output directory and provide one of its checkpoints:
+
+```bash
+START_CHECKPOINT=outputs/one_hour/HCM0421/chkpnt1500.pth \
+scripts/train_sogs_one_hour.sh \
+  data/HCM0421/train \
+  outputs/one_hour/HCM0421
+```
+
+Without `START_CHECKPOINT`, the launcher rejects a non-empty output directory
+to protect previous results.
+
+The general competition launcher also accepts:
+
+```text
+--max-runtime-minutes <minutes>
+--checkpoint-interval <iterations>
+```
+
+The runtime value is applied independently to every selected scene. Use
+`--scenes` with exactly one name when the budget is intended for one scene.
 
 ## 10. Troubleshooting
 
@@ -411,12 +545,14 @@ environment does not prove the GPU training environment is ready.
 
 ### Out of GPU memory
 
-The SOGS renderer now computes global statistics once, materializes augmented
-features only for visible anchors, and checkpoint-recomputes the SOGS branches
-and attribute-MLP activations in bounded chunks. The same bound caps the
-densification duplicate check. `--sogs-chunk-size` controls these allocations;
-smaller values use less peak VRAM but can reduce throughput. For a 24-GiB card,
-retry a fresh scene output with:
+The conservative SOGS path computes scene-global statistics, materializes
+augmented features only for visible anchors, and checkpoint-recomputes the SOGS
+branches and attribute-MLP activations in bounded chunks.
+`--sogs-chunk-size` controls those activation chunks.
+`--densification-chunk-size` separately controls the duplicate-check tile,
+whose temporary tensor has different scaling. Smaller values use less peak
+VRAM but can reduce throughput. For a 24-GiB card, retry a fresh scene output
+with:
 
 ```bash
 python train_competition.py \
@@ -429,6 +565,7 @@ python train_competition.py \
   --num-eigenvectors 2 \
   --lambda-sgl 0.01 \
   --sogs-chunk-size 2048 \
+  --densification-chunk-size 1024 \
   --iterations 30000
 ```
 
@@ -467,10 +604,10 @@ For controlled Scaffold-GS/SOGS comparisons, read
 
 ## 12. Repository status at migration time
 
-No migration commit had been created when this guide was written. The original
-baseline was `9718569d385c618f551242402a26a7db34259c56` on `main`, with the SOGS
-migration present as working-tree changes. Create a feature branch and commit
-only after reviewing the changes in a checkout where `.git` is writable.
+The current A100 pass started on `feature/sogs-integration` at
+`ddef7063f56201e1b4b046d504845c4f31ea382a`. The working tree already contained
+the one-hour/runtime-budget changes listed in the verification report; they
+were preserved. No commit was created by this preparation pass.
 
 For the exact branch, commit, push, training-machine clone, environment setup,
 and separate data-transfer sequence, follow
