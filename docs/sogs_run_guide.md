@@ -387,8 +387,9 @@ small preflight again before retrying:
 scripts/verify_sogs_environment.sh --gpu 0 --data-root data
 ```
 
-It must print `CUDA volume regularization: OK`.  If another operator later
-reports the same NVRTC error, record the GPU name and compute capability:
+It must print both `CUDA volume regularization: OK` and
+`CUDA zero-variance SOGS backward: OK`. If another operator later reports the
+same NVRTC error, record the GPU name and compute capability:
 
 ```bash
 python -c "import torch; p=torch.cuda.get_device_properties(0); print(torch.__version__, torch.version.cuda, p.name, (p.major, p.minor), torch.cuda.get_arch_list())"

@@ -245,9 +245,30 @@ try:
     if scaling.grad is None or not bool(torch.isfinite(scaling.grad).all().item()):
         raise RuntimeError("the CUDA volume-regularizer gradient is invalid")
 
+    from utils.sogs_utils import SecondOrderFeatureAugmentor
+    anchor_features = torch.nn.Parameter(torch.zeros((8, 4), device=device))
+    augmentor = SecondOrderFeatureAugmentor(4, 2).to(device)
+    target = torch.linspace(
+        -1.0, 1.0, steps=8 * 12, device=device
+    ).reshape(8, 12)
+    sogs_loss = (augmentor(anchor_features) - target).square().mean()
+    sogs_loss.backward()
+    if anchor_features.grad is None or not bool(
+        torch.isfinite(anchor_features.grad).all().item()
+    ):
+        raise RuntimeError(
+            "the zero-initialized SOGS anchor-feature gradient is invalid"
+        )
+    for parameter in augmentor.parameters():
+        if parameter.grad is None or not bool(
+            torch.isfinite(parameter.grad).all().item()
+        ):
+            raise RuntimeError("a second-order MLP gradient is invalid")
+
     torch.cuda.synchronize()
     print("Small CUDA tensor operation: OK")
     print("CUDA volume regularization: OK")
+    print("CUDA zero-variance SOGS backward: OK")
 except Exception:
     traceback.print_exc()
     sys.exit(1)

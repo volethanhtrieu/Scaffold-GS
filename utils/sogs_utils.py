@@ -143,14 +143,18 @@ def compute_second_order_statistics(
     covariance = (covariance + covariance.transpose(0, 1)) * 0.5
 
     variances = torch.diagonal(covariance, dim1=0, dim2=1).clamp_min(0.0)
-    standard_deviation = variances.sqrt()
+    variance_floor = float(eps) ** 2
+    # INFERENCE: floor variance before sqrt, not only the later denominator.
+    # Scaffold-GS initializes every anchor feature to zero, and sqrt'(0) is
+    # infinite; masking zero-variance correlations after sqrt therefore still
+    # produced NaN gradients on the first SOGS backward pass.
+    standard_deviation = variances.clamp_min(variance_floor).sqrt()
     denominator = standard_deviation[:, None] * standard_deviation[None, :]
-    valid = (standard_deviation[:, None] > eps) & (
-        standard_deviation[None, :] > eps
-    )
+    valid_dimensions = variances > variance_floor
+    valid = valid_dimensions[:, None] & valid_dimensions[None, :]
     correlation = torch.where(
         valid,
-        covariance / denominator.clamp_min(float(eps) ** 2),
+        covariance / denominator,
         torch.zeros_like(covariance),
     )
     # INFERENCE: zero-variance channels have no measurable pairwise

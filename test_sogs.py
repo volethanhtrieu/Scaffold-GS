@@ -210,11 +210,38 @@ class SecondOrderShapeAndNumericalTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(features.grad).all().item())
 
     def test_constant_features(self):
-        features = torch.ones(4, 3)
+        features = torch.ones(4, 3, requires_grad=True)
         statistics = compute_second_order_statistics(features, 2)
         self.assertTrue(torch.isfinite(statistics.covariance).all().item())
         self.assertTrue(torch.isfinite(statistics.correlation).all().item())
         self.assertTrue(torch.allclose(statistics.covariance, torch.zeros(3, 3)))
+        statistics.correlation.square().sum().backward()
+        self.assertIsNotNone(features.grad)
+        self.assertTrue(torch.isfinite(features.grad).all().item())
+
+    def test_zero_initialized_features_remain_finite_across_steps(self):
+        # COMPATIBILITY: Scaffold-GS initializes every anchor feature to zero.
+        # Exercise a non-uniform downstream signal so the test covers the
+        # eigendecomposition gradient used during actual rendering.
+        features = torch.nn.Parameter(torch.zeros(8, 4))
+        augmentor = SecondOrderFeatureAugmentor(4, 2)
+        target = torch.linspace(-1.0, 1.0, steps=8 * 12).reshape(8, 12)
+        optimizer = torch.optim.Adam(
+            [features] + list(augmentor.parameters()),
+            lr=0.0075,
+            eps=1e-15,
+        )
+        for _ in range(3):
+            loss = (augmentor(features) - target).square().mean()
+            loss.backward()
+            self.assertIsNotNone(features.grad)
+            self.assertTrue(torch.isfinite(features.grad).all().item())
+            for parameter in augmentor.parameters():
+                self.assertIsNotNone(parameter.grad)
+                self.assertTrue(torch.isfinite(parameter.grad).all().item())
+            optimizer.step()
+            self.assertTrue(torch.isfinite(features).all().item())
+            optimizer.zero_grad(set_to_none=True)
 
     def test_single_anchor(self):
         features = torch.tensor([[1.0, 2.0, 3.0]])
